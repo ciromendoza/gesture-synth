@@ -45,22 +45,28 @@ const EFFECT_NAMES = ['Reverb', 'Vibrato', 'Bitcrusher', 'Filter', 'Delay', 'Tre
 export class GraphicEngine {
   constructor(canvas, sab, videoElement) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
+    this.ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
     this.sab = sab;
     this.video = videoElement;
 
     this.int32View = new Int32Array(sab);
     this.float32View = new Float32Array(sab);
+    this.handPoints = new Float32Array(42); // reused for either hand
 
     this.isRunning = false;
+    this.renderFrameId = null;
+    this.lastRenderAt = 0;
+    this.renderInterval = 1000 / 30;
     this.fps = 0;
     this.frameCount = 0;
     this.fpsTimer = performance.now();
     this.cameraFps = 0; // set externally by main.js (MediaPipe frame loop)
     this._lastChordIndex = -1; // preserved during release tail for chord tag fade
+    this._boundRenderLoop = (now) => this.renderLoop(now);
+    this._onResize = () => this.resizeCanvas();
 
     this.resizeCanvas();
-    window.addEventListener('resize', () => this.resizeCanvas());
+    window.addEventListener('resize', this._onResize);
   }
 
   // Called by main.js once per second with the measured MediaPipe frame rate.
@@ -77,23 +83,37 @@ export class GraphicEngine {
   start() {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.lastRenderAt = 0;
     this.fpsTimer = performance.now();
-    this.renderLoop();
+    this.renderFrameId = requestAnimationFrame(this._boundRenderLoop);
   }
 
-  stop() { this.isRunning = false; }
-
-  renderLoop() {
-    if (!this.isRunning) return;
-    const now = performance.now();
-    this.frameCount++;
-    if (now - this.fpsTimer >= 1000) {
-      this.fps = Math.round((this.frameCount * 1000) / (now - this.fpsTimer));
-      this.frameCount = 0;
-      this.fpsTimer = now;
+  stop() {
+    this.isRunning = false;
+    if (this.renderFrameId !== null) {
+      cancelAnimationFrame(this.renderFrameId);
+      this.renderFrameId = null;
     }
-    this.render();
-    requestAnimationFrame(() => this.renderLoop());
+  }
+
+  destroy() {
+    this.stop();
+    window.removeEventListener('resize', this._onResize);
+  }
+
+  renderLoop(now) {
+    if (!this.isRunning) return;
+    if (this.lastRenderAt === 0 || now - this.lastRenderAt >= this.renderInterval) {
+      this.lastRenderAt = now;
+      this.frameCount++;
+      if (now - this.fpsTimer >= 1000) {
+        this.fps = Math.round((this.frameCount * 1000) / (now - this.fpsTimer));
+        this.frameCount = 0;
+        this.fpsTimer = now;
+      }
+      this.render();
+    }
+    this.renderFrameId = requestAnimationFrame(this._boundRenderLoop);
   }
 
   render() {
@@ -101,15 +121,17 @@ export class GraphicEngine {
     const h = this.canvas.height;
     const ctx = this.ctx;
 
-    // 1. Camera feed (mirrored)
-    this.drawCameraFeed(w, h);
+    // The camera is rendered by the browser's compositor in the video layer;
+    // this canvas is an inexpensive transparent overlay.
+    ctx.clearRect(0, 0, w, h);
 
-    // 2. Oscilloscope (transparent, left strip)
+    // 1. Oscilloscope (transparent, left strip)
     this.drawOscilloscope(w, h);
 
-    // 3. SAB state
-    const rightDetected = this.int32View[32];
-    const leftDetected = this.int32View[96];
+    // 2. SAB state. Atomics.load pairs with the worker's final publication of
+    // each hand flag, preventing the overlay from reading half-written points.
+    const rightDetected = Atomics.load(this.int32View, 32);
+    const leftDetected = Atomics.load(this.int32View, 96);
 
     // 4. Left hand: pinch circle
     if (leftDetected === 1) {
@@ -127,21 +149,6 @@ export class GraphicEngine {
 
     // 7. Top-right: left hand data bars inside HUD panel (includes FPS)
     this.drawDataBars();
-  }
-
-  // ─── Camera (mirrored) ─────────────────────────────────────────────────
-  drawCameraFeed(w, h) {
-    const ctx = this.ctx;
-    if (!this.video || this.video.readyState < 2) {
-      ctx.fillStyle = '#111';
-      ctx.fillRect(0, 0, w, h);
-      return;
-    }
-    ctx.save();
-    ctx.translate(w, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(this.video, 0, 0, w, h);
-    ctx.restore();
   }
 
   // ─── Oscilloscope: flat ellipses (equalizer dots), no connecting line ──
@@ -194,13 +201,13 @@ export class GraphicEngine {
     const ctx = this.ctx;
     const w = this.canvas.width;
     const h = this.canvas.height;
+    const pts = this.handPoints;
 
-    const pts = [];
-    for (let i = 0; i < 21; i++) {
-      pts.push({
-        x: (1.0 - this.float32View[offset + i * 2]) * w,
-        y: this.float32View[offset + i * 2 + 1] * h
-      });
+    // Reuse one interleaved coordinate buffer for both hands. The old version
+    // created 21 point objects per hand on every render.
+    for (let i = 0; i < 42; i += 2) {
+      pts[i] = (1.0 - this.float32View[offset + i]) * w;
+      pts[i + 1] = this.float32View[offset + i + 1] * h;
     }
 
     ctx.save();
@@ -210,18 +217,23 @@ export class GraphicEngine {
     ctx.shadowBlur = 0;
 
     ctx.globalAlpha = 0.4;
-    for (const [a, b] of HAND_CONNECTIONS) {
+    for (let c = 0; c < HAND_CONNECTIONS.length; c++) {
+      const connection = HAND_CONNECTIONS[c];
+      const a = connection[0] * 2;
+      const b = connection[1] * 2;
       ctx.beginPath();
-      ctx.moveTo(pts[a].x, pts[a].y);
-      ctx.lineTo(pts[b].x, pts[b].y);
+      ctx.moveTo(pts[a], pts[a + 1]);
+      ctx.lineTo(pts[b], pts[b + 1]);
       ctx.stroke();
     }
 
     ctx.globalAlpha = 1.0;
-    for (let i = 0; i < pts.length; i++) {
-      const r = (i === 4 || i === 8 || i === 12 || i === 16 || i === 20) ? 5 : 3;
+    for (let i = 0; i < 42; i += 2) {
+      const landmarkIndex = i / 2;
+      const r = (landmarkIndex === 4 || landmarkIndex === 8 || landmarkIndex === 12 ||
+        landmarkIndex === 16 || landmarkIndex === 20) ? 5 : 3;
       ctx.beginPath();
-      ctx.arc(pts[i].x, pts[i].y, r, 0, Math.PI * 2);
+      ctx.arc(pts[i], pts[i + 1], r, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.restore();
@@ -295,7 +307,7 @@ export class GraphicEngine {
 
     const pinchDist = this.float32View[97];
     const palmRot = this.float32View[98];
-    const leftDetected = this.int32View[96];
+    const leftDetected = Atomics.load(this.int32View, 96);
     const selectedEffect = this.int32View[10];
     const selectedPad = this.int32View[30];
 
@@ -407,7 +419,7 @@ export class GraphicEngine {
     const chordIdx = this._lastChordIndex;
     if (chordIdx < 0 || chordIdx > 5) return;
 
-    const rightDetected = this.int32View[32];
+    const rightDetected = Atomics.load(this.int32View, 32);
     if (rightDetected !== 1) return; // no tag when hand is absent
 
     // Right wrist, converted like the other landmarks (mirror inversion)

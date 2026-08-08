@@ -3,6 +3,11 @@
 import { PAD_CLASSES } from './pad-registry.js';
 
 const DENORMAL = 1e-18; // prevent denormal floats
+const TWO_PI = 2 * Math.PI;
+const MINOR_THIRD_RATIO = Math.pow(2, -1 / 12);
+const AUDIO_SILENCE_EPS = 0.0005;
+const EFFECT_TAIL_EPS = 1e-6;
+const MAX_RENDER_QUANTUM = 128;
 
 class AudioEngineProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -15,27 +20,26 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     }
 
     this.sampleRate = globalThis.sampleRate || 48000;
-    this.sampleIndex = 0;
 
-    // Envelope (pasos de attack/release se calculan desde la voz activa abajo)
+    // Envelope (steps are calculated from the active voice below)
     this.envelope = 0.0;
     this.envelopeState = 'OFF';
     this.fastReleaseStep = 1.0 / (0.008 * this.sampleRate); // 8 ms — hot-swap de pad
     this.currentChordIndex = -1;
     this.noteHeld = false;
 
-    // Synth voices — 6 instancias pre-alocadas una sola vez (registry+factory).
-    // Cada voz trae su propia envolvente (attackTime/releaseTime, fuente única
-    // de default en constants.js); los pasos se recalculan al cambiar de pad.
+    // Synth voices are instantiated once. The current project ships five
+    // catalog entries; adding a voice only requires extending the registry.
     this.voices = PAD_CLASSES.map(Cls => new Cls(this.sampleRate));
     this.voice = this.voices[0];
     this.currentPad = -1;
     this.attackStep = 1.0 / (this.voice.attackTime * this.sampleRate);
     this.releaseStep = 1.0 / (this.voice.releaseTime * this.sampleRate);
 
-    // Pre-allocated buffers (no alloc in process!)
-    this.dryBuf = new Float32Array(128);
-    this.wetBuf = new Float32Array(128);
+    // Pre-allocated buffers. Nothing in process() creates arrays or objects.
+    this.dryBuf = new Float32Array(MAX_RENDER_QUANTUM);
+    this.wetBuf = new Float32Array(MAX_RENDER_QUANTUM);
+    this.renderFreqs = new Float32Array(3);
 
     // Effect state
     this.delayBuf = new Float32Array(Math.ceil(this.sampleRate));
@@ -44,8 +48,24 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     this.reverbWritePos = 0;
     this.reverbTaps = [0, Math.round(0.023 * this.sampleRate), Math.round(0.053 * this.sampleRate),
                        Math.round(0.091 * this.sampleRate), Math.round(0.137 * this.sampleRate)];
+    this.reverbGains = new Float32Array(this.reverbTaps.length);
     this.filterPrev = 0.0;
     this.crushHold = 0.0;
+    this.effectTailActive = false;
+    this.effectsBypassed = true;
+
+    // Per-block effect coefficients. Parameters are read once per audio
+    // quantum; keeping these out of the sample loop removes expensive pow/exp
+    // calls without changing the smoothing behavior between blocks.
+    this.reverbDecay = 0.3;
+    this.bitLevels = 4096;
+    this.filterA = 0.0;
+    this.chorusDepth = 0.02;
+    this.chorusPhaseStep = 0.0;
+    this.delayTargetSamples = 0.1 * this.sampleRate;
+    this.delayFeedback = 0.15;
+    this.tremTargetRate = 2;
+    this.tremDepth = 0;
 
     // Smoothed params
     this.smoothVol = 0.0;
@@ -54,8 +74,6 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     this.SMOOTH = 0.12; // faster response, still no clicks
 
     // LFO phase accumulators — persistent, incremented per-sample.
-    // Deriving phase from sampleIndex * rate causes a phase jump every time
-    // rate changes, and the jump grows as sampleIndex keeps growing.
     this._chorusPhase = 0;
     this._tremPhase = 0;
     this._tremRate = 2; // smoothed per-sample in fxTremolo
@@ -64,17 +82,56 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
 
   clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-  // Read 6 chords × 3 notes from SAB config zone (float32 index 11–28)
-  readChords() {
-    const chords = [];
-    for (let c = 0; c < 6; c++) {
-      const notes = [];
-      for (let n = 0; n < 3; n++) {
-        notes.push(this.float32View[11 + c * 3 + n]);
-      }
-      chords.push(notes);
+  prepareEffectParams(param) {
+    this.reverbDecay = 0.3 + param * 0.35;
+    let gain = this.reverbDecay;
+    for (let t = 0; t < this.reverbGains.length; t++) {
+      this.reverbGains[t] = gain;
+      gain *= this.reverbDecay;
     }
-    return chords;
+
+    const bits = Math.round(12 - param * 9);
+    this.bitLevels = Math.pow(2, bits);
+
+    const minFreq = 150;
+    const maxFreq = 8000;
+    const cutoffHz = minFreq * Math.pow(maxFreq / minFreq, 1 - param);
+    this.filterA = Math.exp(-2.0 * Math.PI * cutoffHz / this.sampleRate);
+
+    const chorusRate = 3 + param * 8;
+    this.chorusDepth = 0.02 + param * 0.06;
+    this.chorusPhaseStep = (TWO_PI * chorusRate) / this.sampleRate;
+
+    this.delayTargetSamples = (0.1 + param * 0.35) * this.sampleRate;
+    this.delayFeedback = this.clamp(0.15 + param * 0.15, 0, 0.3);
+
+    this.tremTargetRate = 2 + param * 6;
+    this.tremDepth = this.clamp(param * 0.6, 0, 0.6);
+  }
+
+  resetEffects() {
+    this.delayBuf.fill(0);
+    this.reverbBuf.fill(0);
+    this.delayWritePos = 0;
+    this.reverbWritePos = 0;
+    this.filterPrev = 0.0;
+    this.crushHold = 0.0;
+    this._chorusPhase = 0;
+    this._tremPhase = 0;
+    this._tremRate = 2;
+    this._delayTimeTarget = Math.round(0.1 * this.sampleRate);
+    this.effectTailActive = false;
+  }
+
+  writeSilentState(volume, mix, param) {
+    this.float32View[160] = volume;
+    this.float32View[161] = 0.0;
+    this.int32View[162] = -1;
+    this.float32View[163] = 0.0;
+    this.float32View[164] = mix;
+    this.float32View[165] = param;
+    this.float32View[166] = 0.0;
+    for (let k = 0; k < 25; k++) this.float32View[167 + k] = 0.0;
   }
 
   process(inputs, outputs) {
@@ -83,24 +140,24 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     const out = output[0];
     const N = out.length;
 
-    if (!this.int32View || !this.float32View) {
+    if (!this.int32View || !this.float32View || N > MAX_RENDER_QUANTUM) {
       out.fill(0);
+      if (output[1]) output[1].fill(0);
       return true;
     }
 
     // ─── Read SAB ──────────────────────────────────────────────────────
-    const rightDetected = this.int32View[32];
+    const rightDetected = Atomics.load(this.int32View, 32);
     const fingerCount = this.float32View[33];
     const rightPalmRot = this.float32View[34];
-    const leftDetected = this.int32View[96];
+    const leftDetected = Atomics.load(this.int32View, 96);
     const pinchDist = this.float32View[97];
     const leftPalmRot = this.float32View[98];
     const selectedEffect = this.int32View[10];
     const selectedPad = this.int32View[30];
-    const chords = this.readChords();
 
     // ─── Params ────────────────────────────────────────────────────────
-    const rawVol = leftDetected ? pinchDist : 0.7; // pinchDist is already normalized 0–1
+    const rawVol = leftDetected ? pinchDist : 0.7; // pinchDist is normalized 0–1
     this.smoothVol += (rawVol - this.smoothVol) * this.SMOOTH;
 
     let chordIndex = -1;
@@ -121,12 +178,9 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     const volume = this.smoothVol;
     const mix = this.smoothMix;
     const param = this.smoothParam;
+    this.prepareEffectParams(param);
 
     // ─── Pad switch (hot-swap sin click) ─────────────────────────────────
-    // Si el usuario cambia de pad con nota sostenida, cortar el render de un
-    // synth y arrancar el otro a mitad de ciclo genera una discontinuidad
-    // audible (timbres muy distintos no cruzan suave). Fix: RELEASE corto
-    // (8 ms) + re-trigger con el ATTACK de la voz nueva, no el completo.
     if (selectedPad !== this.currentPad) {
       const next = this.voices[selectedPad];
       if (next) {
@@ -150,9 +204,41 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       this.envelopeState = 'RELEASE';
     }
 
-    // ─── Dry generation ────────────────────────────────────────────────
-    const chord = chords[this.currentChordIndex];
+    const voiceWasActive = chordIndex >= 0 || this.envelopeState !== 'OFF' || this.envelope > 0;
+    const effectHasTail = selectedEffect === 0 || selectedEffect === 4;
 
+    // A silent block with no delay/reverb tail does not need to run the DSP
+    // graph. Resetting once prevents stale echoes when the effect is re-enabled.
+    if (!voiceWasActive && (!effectHasTail || !this.effectTailActive || mix <= AUDIO_SILENCE_EPS)) {
+      if (!this.effectsBypassed) {
+        this.resetEffects();
+        this.effectsBypassed = true;
+      }
+      out.fill(0);
+      if (output[1]) output[1].fill(0);
+      this.writeSilentState(volume, mix, param);
+      return true;
+    }
+
+    // Read the active triad once per block. The reusable typed array is passed
+    // to the voice for every sample instead of allocating [f0, f1, f2].
+    const currentChordIndex = this.currentChordIndex;
+    const hasChord = currentChordIndex >= 0 && currentChordIndex < 6;
+    let chord0 = 0;
+    let chord1 = 0;
+    let chord2 = 0;
+    if (hasChord) {
+      const chordBase = 11 + currentChordIndex * 3;
+      chord0 = this.float32View[chordBase];
+      chord1 = this.float32View[chordBase + 1];
+      chord2 = this.float32View[chordBase + 2];
+      const minorThird = chord1 * MINOR_THIRD_RATIO;
+      this.renderFreqs[0] = chord0;
+      this.renderFreqs[1] = chord1 * (1 - majorMinorMix) + minorThird * majorMinorMix;
+      this.renderFreqs[2] = chord2;
+    }
+
+    // ─── Dry generation ────────────────────────────────────────────────
     for (let i = 0; i < N; i++) {
       // Envelope
       if (this.envelopeState === 'ATTACK') {
@@ -172,43 +258,61 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
         }
       } else if (this.envelopeState === 'RELEASE') {
         this.envelope -= this.releaseStep;
-        if (this.envelope <= 0.0) { this.envelope = 0.0; this.envelopeState = 'OFF'; this.currentChordIndex = -1; }
+        if (this.envelope <= 0.0) {
+          this.envelope = 0.0;
+          this.envelopeState = 'OFF';
+          this.currentChordIndex = -1;
+        }
       }
 
-      let sample = DENORMAL; // denormal guard
-      if (this.envelope > 0 && chord) {
-        const thirdMinor = chord[1] * Math.pow(2, -1 / 12);
-        const third = chord[1] * (1 - majorMinorMix) + thirdMinor * majorMinorMix;
-        const freqs = [chord[0], third, chord[2]];
-        sample = this.voice.renderSample(freqs);
+      let sample = DENORMAL;
+      if (this.envelope > 0 && hasChord) {
+        sample = this.voice.renderSample(this.renderFreqs);
         sample *= this.envelope;
         sample *= volume;
       }
       this.dryBuf[i] = sample;
-      this.sampleIndex++;
     }
 
     // ─── Effect ────────────────────────────────────────────────────────
-    for (let i = 0; i < N; i++) {
-      let p = this.dryBuf[i];
-      switch (selectedEffect) {
-        case 0: p = this.fxReverb(this.dryBuf[i], param); break;
-        case 1: p = this.fxChorus(this.dryBuf[i], param); break;
-        case 2: p = this.fxBitcrush(this.dryBuf[i], param); break;
-        case 3: p = this.fxFilter(this.dryBuf[i], param); break;
-        case 4: p = this.fxDelay(this.dryBuf[i], param); break;
-        case 5: p = this.fxTremolo(this.dryBuf[i], param); break;
+    let effectPeak = 0;
+    if (mix <= AUDIO_SILENCE_EPS) {
+      if (!this.effectsBypassed) {
+        this.resetEffects();
+        this.effectsBypassed = true;
       }
-      this.wetBuf[i] = this.dryBuf[i] * (1 - mix) + p * mix;
+      for (let i = 0; i < N; i++) this.wetBuf[i] = this.dryBuf[i];
+    } else {
+      this.effectsBypassed = false;
+      for (let i = 0; i < N; i++) {
+        let p = this.dryBuf[i];
+        switch (selectedEffect) {
+          case 0: p = this.fxReverb(this.dryBuf[i]); break;
+          case 1: p = this.fxChorus(this.dryBuf[i]); break;
+          case 2: p = this.fxBitcrush(this.dryBuf[i]); break;
+          case 3: p = this.fxFilter(this.dryBuf[i]); break;
+          case 4: p = this.fxDelay(this.dryBuf[i]); break;
+          case 5: p = this.fxTremolo(this.dryBuf[i]); break;
+        }
+        const absEffect = Math.abs(p);
+        if (absEffect > effectPeak) effectPeak = absEffect;
+        this.wetBuf[i] = this.dryBuf[i] * (1 - mix) + p * mix;
+      }
+    }
+
+    if (mix <= AUDIO_SILENCE_EPS || !effectHasTail) {
+      this.effectTailActive = false;
+    } else if (voiceWasActive) {
+      this.effectTailActive = true;
+    } else if (effectPeak < EFFECT_TAIL_EPS) {
+      this.effectTailActive = false;
     }
 
     // ─── Output soft-clip ──────────────────────────────────────────────
     for (let i = 0; i < N; i++) {
       let s = this.wetBuf[i];
-      // Soft saturation
       if (s > 0.95) s = 0.95 + (s - 0.95) * 0.3;
       else if (s < -0.95) s = -0.95 + (s + 0.95) * 0.3;
-      // Hard clip
       if (s > 1.0) s = 1.0;
       else if (s < -1.0) s = -1.0;
       out[i] = s;
@@ -217,7 +321,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
 
     // ─── Write SAB ─────────────────────────────────────────────────────
     this.float32View[160] = volume;
-    this.float32View[161] = (chordIndex >= 0 && chord) ? chord[0] : 0.0;
+    this.float32View[161] = (chordIndex >= 0 && hasChord) ? chord0 : 0.0;
     this.int32View[162] = chordIndex;
     this.float32View[163] = majorMinorMix;
     this.float32View[164] = mix;
@@ -236,75 +340,54 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
 
   // ─── Effects (no clipping, no boosts) ─────────────────────────────────
 
-  fxReverb(sample, param) {
+  fxReverb(sample) {
     const idx = this.reverbWritePos;
     this.reverbBuf[idx] = sample + DENORMAL;
     let sum = 0;
-    const decay = 0.3 + param * 0.35; // 0.30–0.65: audible tail at all param values
     for (let t = 0; t < this.reverbTaps.length; t++) {
       const tapIdx = (idx - this.reverbTaps[t] + this.reverbBuf.length) % this.reverbBuf.length;
-      sum += this.reverbBuf[tapIdx] * Math.pow(decay, t + 1);
+      sum += this.reverbBuf[tapIdx] * this.reverbGains[t];
     }
     this.reverbWritePos = (idx + 1) % this.reverbBuf.length;
-    return this.clamp(sum, -1.0, 1.0); // pass through, no extra scaling
+    return this.clamp(sum, -1.0, 1.0);
   }
 
-  fxChorus(sample, param) {
-    // Vibrato/chorus: audible pitch wobble across full param range
-    const depth = 0.02 + param * 0.06; // 2–8% modulation — clearly audible
-    const rate = 3 + param * 8;
-    // Persistent phase accumulator — sampleIndex * rate would jump when rate changes
-    this._chorusPhase += (2 * Math.PI * rate) / this.sampleRate;
-    if (this._chorusPhase >= 2 * Math.PI) this._chorusPhase -= 2 * Math.PI;
-    return sample * (1 + depth * Math.sin(this._chorusPhase));
+  fxChorus(sample) {
+    this._chorusPhase += this.chorusPhaseStep;
+    if (this._chorusPhase >= TWO_PI) this._chorusPhase -= TWO_PI;
+    return sample * (1 + this.chorusDepth * Math.sin(this._chorusPhase));
   }
 
-  fxBitcrush(sample, param) {
-    // Aggressive bit reduction: 12-bit (transparent) down to 3-bit (obvious crush)
-    const bits = Math.round(12 - param * 9);
-    const levels = Math.pow(2, bits);
-    this.crushHold = Math.round(sample * levels) / levels;
+  fxBitcrush(sample) {
+    this.crushHold = Math.round(sample * this.bitLevels) / this.bitLevels;
     return this.crushHold;
   }
 
-  fxFilter(sample, param) {
-    // One-pole low-pass with correct sample-rate coefficient.
-    // param sweeps cutoff logarithmically 150 Hz (param=1) → 8000 Hz (param=0),
-    // perceptually linear so the sweep sounds continuous, not like a switch.
-    const minFreq = 150, maxFreq = 8000;
-    const cutoffHz = minFreq * Math.pow(maxFreq / minFreq, 1 - param);
-    const a = Math.exp(-2.0 * Math.PI * cutoffHz / this.sampleRate);
-    this.filterPrev = this.filterPrev * a + sample * (1 - a) + DENORMAL;
+  fxFilter(sample) {
+    this.filterPrev = this.filterPrev * this.filterA + sample * (1 - this.filterA) + DENORMAL;
     return this.filterPrev;
   }
 
-  fxDelay(sample, param) {
-    // Smooth delay time per-sample to avoid read-position jumps
-    const target = (0.1 + param * 0.35) * this.sampleRate;
-    this._delayTimeTarget += (target - this._delayTimeTarget) * this.SMOOTH;
-    // Fractional interpolation between the two nearest buffer positions —
-    // avoids zipper noise when the (smoothed) delay time crosses integer samples
+  fxDelay(sample) {
+    // Delay time is still smoothed per-sample to avoid zipper noise; its target
+    // and feedback coefficient are calculated once per block.
+    this._delayTimeTarget += (this.delayTargetSamples - this._delayTimeTarget) * this.SMOOTH;
     const delayTimeF = this.clamp(this._delayTimeTarget, 1, this.delayBuf.length - 2);
     const delayTimeInt = Math.floor(delayTimeF);
     const frac = delayTimeF - delayTimeInt;
     const readPos0 = (this.delayWritePos - delayTimeInt + this.delayBuf.length) % this.delayBuf.length;
     const readPos1 = (readPos0 - 1 + this.delayBuf.length) % this.delayBuf.length;
     const delayed = this.delayBuf[readPos0] * (1 - frac) + this.delayBuf[readPos1] * frac;
-    const fb = this.clamp(0.15 + param * 0.15, 0, 0.3);
-    this.delayBuf[this.delayWritePos] = sample + delayed * fb + DENORMAL;
+    this.delayBuf[this.delayWritePos] = sample + delayed * this.delayFeedback + DENORMAL;
     this.delayWritePos = (this.delayWritePos + 1) % this.delayBuf.length;
     return sample * 0.7 + delayed * 0.3;
   }
 
-  fxTremolo(sample, param) {
-    // Smooth rate per-sample to avoid LFO phase discontinuities at block boundaries
-    const targetRate = 2 + param * 6;
-    this._tremRate += (targetRate - this._tremRate) * this.SMOOTH;
-    const depth = this.clamp(param * 0.6, 0, 0.6);
-    // Persistent phase accumulator (see fxChorus)
-    this._tremPhase += (2 * Math.PI * this._tremRate) / this.sampleRate;
-    if (this._tremPhase >= 2 * Math.PI) this._tremPhase -= 2 * Math.PI;
-    const lfo = 1.0 - depth * 0.5 * (1 + Math.sin(this._tremPhase));
+  fxTremolo(sample) {
+    this._tremRate += (this.tremTargetRate - this._tremRate) * this.SMOOTH;
+    this._tremPhase += (TWO_PI * this._tremRate) / this.sampleRate;
+    if (this._tremPhase >= TWO_PI) this._tremPhase -= TWO_PI;
+    const lfo = 1.0 - this.tremDepth * 0.5 * (1 + Math.sin(this._tremPhase));
     return sample * lfo;
   }
 }

@@ -1,12 +1,22 @@
 // Tracking Worker (Gesture Computation)
 // Runs in a dedicated Web Worker thread.
-// Receives raw landmarks from the main thread via postMessage,
-// computes finger count, palm rotation, pinch distance with hysteresis,
-// and writes all gesture data directly to the SharedArrayBuffer.
+// Landmark coordinates are written by the main thread into SAB tracking slots;
+// postMessage carries only a small slot/sequence token, never the landmark data.
 
 let sab = null;
 let int32View = null;
 let float32View = null;
+
+// These values mirror TRACKING_INPUT in constants.js. This worker intentionally
+// stays classic (not an ES module) because MediaPipe's worker integration has
+// that requirement in this project.
+const SLOT_COUNT = 3;
+const SLOT_SEQUENCE = 0;
+const SLOT_RIGHT_PRESENT = 1;
+const SLOT_LEFT_PRESENT = 2;
+const SLOT_RIGHT_LANDMARKS = 3;
+const SLOT_LEFT_LANDMARKS = 45;
+const SLOT_STARTS = [198, 285, 372];
 
 // Finger hysteresis tracking states (persist across frames)
 const fingerStates = {
@@ -32,53 +42,75 @@ self.onmessage = (e) => {
     float32View = new Float32Array(sab);
     self.postMessage({ type: 'ready' });
 
-  } else if (data.type === 'landmarks') {
-    // Receive pre-extracted landmarks from MediaPipe on the main thread
-    // data.rightHand = array of 21 {x,y} or null
-    // data.leftHand  = array of 21 {x,y} or null
-    processFrame(data.rightHand, data.leftHand);
+  } else if (data.type === 'frame') {
+    if (Number.isInteger(data.slot) && Number.isInteger(data.sequence)) {
+      processFrame(data.slot, data.sequence);
+    }
   }
 };
 
-function processFrame(rightLandmarks, leftLandmarks) {
-  if (!int32View || !float32View) return;
+function isValidSlot(slot) {
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    if (SLOT_STARTS[i] === slot) return true;
+  }
+  return false;
+}
+
+function processFrame(slot, sequence) {
+  if (!int32View || !float32View || !isValidSlot(slot)) return;
+
+  // A negative sequence means the producer is still writing the slot. A
+  // mismatch means this message was superseded; latest-frame-wins is safer
+  // than processing stale gesture data.
+  if (Atomics.load(int32View, slot + SLOT_SEQUENCE) !== sequence) return;
+
+  const rightPresent = Atomics.load(int32View, slot + SLOT_RIGHT_PRESENT) === 1;
+  const leftPresent = Atomics.load(int32View, slot + SLOT_LEFT_PRESENT) === 1;
+  const rightOffset = slot + SLOT_RIGHT_LANDMARKS;
+  const leftOffset = slot + SLOT_LEFT_LANDMARKS;
 
   // ─── RIGHT HAND ─────────────────────────────────────────────────────────
-  if (rightLandmarks) {
-    int32View[32] = 1; // handDetected
-
-    // Wrist
-    const wrist = rightLandmarks[0];
-    float32View[35] = wrist.x;
-    float32View[36] = wrist.y;
+  if (rightPresent) {
+    const wristX = float32View[rightOffset];
+    const wristY = float32View[rightOffset + 1];
 
     // Finger Count with hysteresis
     // Thumb: distance-based (orientation-invariant) — compare how far tip(4)
     // is from pinky MCP(17) vs how far IP(3) is from pinky MCP(17).
-    // If tip is farther, thumb is extended regardless of hand rotation.
-    const thumbTip = rightLandmarks[4];
-    const thumbIP = rightLandmarks[3];
-    const pinkyMCP = rightLandmarks[17];
-    const tipDist = Math.hypot(thumbTip.x - pinkyMCP.x, thumbTip.y - pinkyMCP.y);
-    const ipDist = Math.hypot(thumbIP.x - pinkyMCP.x, thumbIP.y - pinkyMCP.y);
-    const thumbDiff = tipDist - ipDist; // >0 = extended
-    fingerStates.thumb = applyHysteresis(thumbDiff, fingerStates.thumb);
+    const thumbTip = rightOffset + 4 * 2;
+    const thumbIP = rightOffset + 3 * 2;
+    const pinkyMCP = rightOffset + 17 * 2;
+    const tipDX = float32View[thumbTip] - float32View[pinkyMCP];
+    const tipDY = float32View[thumbTip + 1] - float32View[pinkyMCP + 1];
+    const ipDX = float32View[thumbIP] - float32View[pinkyMCP];
+    const ipDY = float32View[thumbIP + 1] - float32View[pinkyMCP + 1];
+    const tipDist = Math.hypot(tipDX, tipDY);
+    const ipDist = Math.hypot(ipDX, ipDY);
+    fingerStates.thumb = applyHysteresis(tipDist - ipDist, fingerStates.thumb);
 
     // Index: tip(8).y < pip(6).y  (smaller Y = higher on screen)
-    const indexDiff = rightLandmarks[6].y - rightLandmarks[8].y;
-    fingerStates.index = applyHysteresis(indexDiff, fingerStates.index);
+    fingerStates.index = applyHysteresis(
+      float32View[rightOffset + 6 * 2 + 1] - float32View[rightOffset + 8 * 2 + 1],
+      fingerStates.index
+    );
 
     // Middle: tip(12).y < pip(10).y
-    const middleDiff = rightLandmarks[10].y - rightLandmarks[12].y;
-    fingerStates.middle = applyHysteresis(middleDiff, fingerStates.middle);
+    fingerStates.middle = applyHysteresis(
+      float32View[rightOffset + 10 * 2 + 1] - float32View[rightOffset + 12 * 2 + 1],
+      fingerStates.middle
+    );
 
     // Ring: tip(16).y < pip(14).y
-    const ringDiff = rightLandmarks[14].y - rightLandmarks[16].y;
-    fingerStates.ring = applyHysteresis(ringDiff, fingerStates.ring);
+    fingerStates.ring = applyHysteresis(
+      float32View[rightOffset + 14 * 2 + 1] - float32View[rightOffset + 16 * 2 + 1],
+      fingerStates.ring
+    );
 
     // Pinky: tip(20).y < pip(18).y
-    const pinkyDiff = rightLandmarks[18].y - rightLandmarks[20].y;
-    fingerStates.pinky = applyHysteresis(pinkyDiff, fingerStates.pinky);
+    fingerStates.pinky = applyHysteresis(
+      float32View[rightOffset + 18 * 2 + 1] - float32View[rightOffset + 20 * 2 + 1],
+      fingerStates.pinky
+    );
 
     let count = 0;
     if (fingerStates.thumb) count++;
@@ -86,64 +118,60 @@ function processFrame(rightLandmarks, leftLandmarks) {
     if (fingerStates.middle) count++;
     if (fingerStates.ring) count++;
     if (fingerStates.pinky) count++;
-    float32View[33] = count;
 
     // Palm Rotation: angle from wrist(0) to middle MCP(9)
-    const mcp9 = rightLandmarks[9];
-    const dx = mcp9.x - wrist.x;
-    const dy = -(mcp9.y - wrist.y);
-    float32View[34] = Math.abs(Math.atan2(dx, dy));
+    const mcp9 = rightOffset + 9 * 2;
+    const dx = float32View[mcp9] - wristX;
+    const dy = -(float32View[mcp9 + 1] - wristY);
 
-    // Write 21 landmarks (x, y) — 42 floats
-    for (let i = 0; i < 21; i++) {
-      float32View[37 + i * 2] = rightLandmarks[i].x;
-      float32View[37 + i * 2 + 1] = rightLandmarks[i].y;
+    // Write computed right-hand data. The detection flag is published only
+    // after all coordinates are written, so readers never consume a half frame.
+    float32View[33] = count;
+    float32View[34] = Math.abs(Math.atan2(dx, dy));
+    float32View[35] = wristX;
+    float32View[36] = wristY;
+    for (let i = 0; i < 42; i++) {
+      float32View[37 + i] = float32View[rightOffset + i];
     }
-  } else {
-    int32View[32] = 0; // right hand not detected
   }
 
   // ─── LEFT HAND ──────────────────────────────────────────────────────────
-  if (leftLandmarks) {
-    int32View[96] = 1; // handDetected
-
-    // Wrist
-    const wrist = leftLandmarks[0];
-    float32View[99] = wrist.x;
-    float32View[100] = wrist.y;
+  if (leftPresent) {
+    const wristX = float32View[leftOffset];
+    const wristY = float32View[leftOffset + 1];
 
     // Pinch Distance (thumb tip 4 ↔ index tip 8) — normalized by palmLen
     // for invariance to camera distance and hand size.
-    // 0 = fingers touching (closed), 1 = fully open
-    const thumbTip = leftLandmarks[4];
-    const indexTip = leftLandmarks[8];
-    const pinchDist = Math.sqrt(
-      (thumbTip.x - indexTip.x) ** 2 +
-      (thumbTip.y - indexTip.y) ** 2
-    );
-    const mcp9 = leftLandmarks[9];
-    const palmLen = Math.hypot(mcp9.x - wrist.x, mcp9.y - wrist.y) || 1e-6;
+    const thumbTip = leftOffset + 4 * 2;
+    const indexTip = leftOffset + 8 * 2;
+    const pinchDX = float32View[thumbTip] - float32View[indexTip];
+    const pinchDY = float32View[thumbTip + 1] - float32View[indexTip + 1];
+    const pinchDist = Math.sqrt(pinchDX * pinchDX + pinchDY * pinchDY);
+    const mcp9 = leftOffset + 9 * 2;
+    const palmDX = float32View[mcp9] - wristX;
+    const palmDY = float32View[mcp9 + 1] - wristY;
+    const palmLen = Math.hypot(palmDX, palmDY) || 1e-6;
     const pinchDistNorm = pinchDist / palmLen;
-    float32View[97] = clamp01((pinchDistNorm - PINCH_MIN_NORM) / (PINCH_MAX_NORM - PINCH_MIN_NORM));
 
     // Pitch: angle of the wrist→MCP(9) vector from vertical.
-    // MCP(9) is the middle finger's MCP — rigid palm structure, does not move
-    // when fingers flex. Range limited to 45° (π/4).
-    // 0° = upright, 45° = tilted forward. Mapped to 0–π in SAB so audio-engine
-    // still sees 0–1 via leftPalmRot/π.
-    const dx = mcp9.x - wrist.x;
-    const dy = mcp9.y - wrist.y;
-    const pitchAngle = Math.atan2(dx, -dy); // angle from vertical
-    float32View[98] = clamp01(pitchAngle / (Math.PI / 4)) * Math.PI;
+    const pitchAngle = Math.atan2(palmDX, -palmDY);
 
-    // Write 21 landmarks (x, y)
-    for (let i = 0; i < 21; i++) {
-      float32View[101 + i * 2] = leftLandmarks[i].x;
-      float32View[101 + i * 2 + 1] = leftLandmarks[i].y;
+    float32View[97] = clamp01((pinchDistNorm - PINCH_MIN_NORM) / (PINCH_MAX_NORM - PINCH_MIN_NORM));
+    float32View[98] = clamp01(pitchAngle / (Math.PI / 4)) * Math.PI;
+    float32View[99] = wristX;
+    float32View[100] = wristY;
+    for (let i = 0; i < 42; i++) {
+      float32View[101 + i] = float32View[leftOffset + i];
     }
-  } else {
-    int32View[96] = 0; // left hand not detected
   }
+
+  // If the main thread began reusing this slot while we were reading it, do
+  // not publish the partially computed frame. A newer message will publish the
+  // next valid frame.
+  if (Atomics.load(int32View, slot + SLOT_SEQUENCE) !== sequence) return;
+
+  Atomics.store(int32View, 32, rightPresent ? 1 : 0);
+  Atomics.store(int32View, 96, leftPresent ? 1 : 0);
 }
 
 function applyHysteresis(diff, currentState) {

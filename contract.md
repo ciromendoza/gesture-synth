@@ -16,10 +16,13 @@ completamente cliente-servidor sin bundlers ni frameworks.
 - **Cámara**: MediaPipe Hands para detección de manos (2 manos, 21 landmarks cada una).
 - **Comunicación entre hilos**: un único `SharedArrayBuffer` de 2048 bytes
   compartido entre el worker de tracking, el AudioWorklet y el main thread.
+  Los landmarks entran por slots del SAB; `postMessage` solo transporta un
+  token pequeño de slot/secuencia.
 - **Audio**: AudioWorkletProcessor (`audio-engine.js`) genera síntesis por
-  **6 pads seleccionables** (librería de la intro, interfaz `SynthVoice`
+  **5 pads seleccionables** (librería de la intro, interfaz `SynthVoice`
   común) + 6 efectos DSP compartidos.
-- **Visualización**: Canvas2D espejado de la cámara, landmarks blancos,
+- **Visualización**: vídeo espejado en una capa del compositor del navegador
+  y Canvas2D transparente solo para overlays, landmarks blancos,
   osciloscopio vertical a la izquierda, círculo de pinch, barras de datos.
 
 ---
@@ -57,10 +60,10 @@ pantalla de inicio. Los archivos de MediaPipe se sirven localmente desde
 │  MAIN THREAD (public/main.js)                                   │
 │  • Orquestador: crea SAB, cámara, MediaPipe, worker, audio, UI  │
 │  • MediaPipe corre AQUÍ (no en worker) — ver sección 8.1        │
-│  • Loop @30fps: send() → landmarks → postMessage al worker      │
+│  • Loop por frame de vídeo: send() → landmarks → token al worker │
 │  • Escribe config en SAB (writeConfigToSAB)                     │
 └──────────────┬──────────────────────────────────────────────────┘
-               │ postMessage({type:'landmarks', rightHand, leftHand})
+               │ postMessage({type:'frame', slot, sequence})
                │
 ┌──────────────▼──────────────────────────────────────────────────┐
 │  TRACKING WORKER (public/tracking-worker.js)  [classic worker]  │
@@ -70,14 +73,14 @@ pantalla de inicio. Los archivos de MediaPipe se sirven localmente desde
                │ SAB (SharedArrayBuffer 2048 bytes, lectura/escritura directa)
 ┌──────────────▼──────────────────────────────────────────────────┐
 │  AUDIO WORKLET (public/audio-engine.js)  [AudioWorklet]         │
-│  • LEE gestos de SAB cada bloque de 128 muestras @48kHz         │
+│  • LEE gestos de SAB cada bloque de 128 muestras @sampleRate     │
 │  • Síntesis aditiva de acordes + 6 efectos + envolvente         │
 │  • ESCRIBE estado de audio en SAB (índices 160–191)             │
 └──────────────┬──────────────────────────────────────────────────┘
                │ SAB
 ┌──────────────▼──────────────────────────────────────────────────┐
 │  GRAPHIC ENGINE (public/graphic-engine.js)  [main thread]       │
-│  • Canvas2D fullscreen, cámara espejada de fondo                │
+│  • Canvas2D overlay transparente sobre el vídeo espejado        │
 │  • LEE SAB para dibujar landmarks, osciloscopio, círculo, etc.  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -107,27 +110,35 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | Mano derecha | 32–95 | detección, dedos, rotación, wrist, 42 floats de landmarks |
 | Mano izquierda | 96–159 | detección, pinch normalizado, rotación, wrist, 42 floats de landmarks |
 | Audio state | 160–191 | volumen, frecuencia, acorde activo, osciloscopio (25 floats) |
-| Reservado | 192–511 | 192–197: role index por acorde (int32 × 6); resto libre |
+| Reservado | 192–511 | 192–197: roles; 198–458: 3 slots de landmarks; resto libre |
 
 ### 4.2 Índices exactos (fuente de verdad: `public/constants.js` → `INDEXES`)
 
 **Config (escrito por main.js):**
 | Índice | Tipo | Campo |
 |---|---|---|
-| 0 | int32 | sampleRate (48000) |
+| 0 | int32 | sampleRate real del `AudioContext` (habitualmente 44100/48000) |
 | 1 | int32 | bufferSize (128) |
 | 2 | int32 | canvas width |
 | 3 | int32 | canvas height |
 | 4 | int32 | camera width (640) |
 | 5 | int32 | camera height (480) |
 | 6 | int32 | maxHands (2) |
-| 7 | int32 | modelComplexity (1) |
+| 7 | int32 | modelComplexity (0 Lite / 1 Full) |
 | 8 | int32 | minDetectionConf (500 = 0.5×1000) |
 | 9 | int32 | minTrackingConf (500) |
 | 10 | int32 | selectedEffect (0–5) |
 | 11–28 | float32 | 6 acordes × 3 frecuencias (generadas por escala+tónica) |
 | 29 | int32 | rootNote (0–11, índice en NOTE_NAMES) |
-| 30 | int32 | selectedPad (0–5, posición en PAD_CLASSES / PAD_CATALOG) |
+| 30 | int32 | selectedPad (0–4, posición en PAD_CLASSES / PAD_CATALOG) |
+
+**Entrada de tracking (escrita por main.js, leída por tracking-worker):**
+
+Cada slot ocupa 87 índices: `sequence`, `rightPresent`, `leftPresent`,
+42 floats de mano derecha y 42 floats de mano izquierda. Los slots empiezan
+en 198, 285 y 372. El main escribe una secuencia negativa mientras el slot
+está en progreso y publica la secuencia positiva al terminar; el worker
+descarta tokens obsoletos o slots incompletos.
 
 **Mano derecha (escrito por tracking-worker):**
 | Índice | Tipo | Campo |
@@ -161,8 +172,9 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | 166 | float32 | envelope (0–1) |
 | 167–191 | float32 | osciloscopio (25 muestras) |
 
-> El código usa **exclusivamente** `INDEXES` (índices de TypedArray). Los
-> offsets en bytes fueron eliminados de constants.js — no reintroducirlos.
+> `constants.js` es la referencia de índices y offsets del SAB. Los índices
+> nuevos de entrada de tracking se exportan como `TRACKING_INPUT`; no
+> reintroducir offsets en bytes.
 
 ---
 
@@ -171,15 +183,15 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 ### main → tracking-worker
 ```js
 { type: 'init', sab, config: {} }              // al arrancar; worker responde { type:'ready' }
-{ type: 'landmarks', rightHand: arr21|null, leftHand: arr21|null }  // @30fps
+{ type: 'frame', slot, sequence }              // token; coordenadas están en SAB
 ```
 
 ### Notas
 - El worker es **classic** (`new Worker('/tracking-worker.js')`), no module.
 - `sab` se pasa por referencia en postMessage (los SAB se comparten, NO se
   transfieren — nunca ponerlo en la lista de transfer).
-- MediaPipe corre en main thread; el worker solo recibe landmarks ya
-  extraídos y escribe en el SAB.
+- MediaPipe corre en main thread; el main escribe landmarks en los slots del
+  SAB y el worker solo recibe el token de slot/secuencia.
 
 ---
 
@@ -281,14 +293,19 @@ const SCALES = {
 - **MediaPipe corre en el main thread** (no en worker) porque
   `@mediapipe/hands` usa `importScripts` internamente para sus `.wasm`/`.tflite`,
   lo cual falla dentro de workers. Es una restricción conocida.
-- Frame loop @30fps: `handsInstance.send({image: videoElement})` →
-  separa landmarks por `multiHandedness[i].label === 'Right'` →
-  postMessage al worker. En espejo, la mano derecha del usuario aparece como
-  "Left" según MediaPipe según la convención de imagen — se usa el label tal cual.
-- `cleanup()` libera cámara, worker, audio y gráficos.
+- El loop usa `requestVideoFrameCallback()` cuando está disponible y un
+  fallback con `requestAnimationFrame`; no procesa dos veces el mismo
+  `video.currentTime` ni permite inferencias concurrentes.
+- `handsInstance.send({image: videoElement})` separa landmarks por
+  `multiHandedness[i].label === 'Right'` y escribe los `x/y` en el SAB. El
+  worker recibe solo `{type:'frame', slot, sequence}`.
+- La cámara está limitada a 640×480 y 30 FPS. `?tracking=lite` fuerza el
+  modelo Lite; dispositivos de bajo consumo lo seleccionan automáticamente.
+- `cleanup()` libera cámara, worker, audio, MediaPipe y listeners gráficos.
 
 ### 8.2 `public/tracking-worker.js` — gestos
-- Classic worker. Escribe TODO lo de la sección 4.2.
+- Classic worker. Lee la entrada de landmarks desde los slots del SAB y
+  escribe TODO lo de la sección 4.2. No recibe arrays de objetos por mensaje.
 - Histéresis por dedo (estados persistentes entre frames).
 - `applyHysteresis(diff, state)`: si `diff > 0.02` → true; `< -0.02` → false.
 - Pulgar: detección por distancias (tip→pinkyMCP vs IP→pinkyMCP), no por eje x.
@@ -299,21 +316,21 @@ const SCALES = {
 
 ### 8.3 `public/audio-engine.js` — AudioWorkletProcessor
 - Registrado como `'gesture-synthesizer'`.
-- **Prohibido asignar memoria dentro de `process()`** — todos los buffers se
-  pre-allocan en el constructor (`dryBuf`, `wetBuf`, `delayBuf`, `reverbBuf`).
+- **Prohibido asignar memoria dentro de `process()`** — todos los buffers,
+  frecuencias y coeficientes persistentes se pre-alocan en el constructor.
+  No se crean arrays por bloque/muestra.
 - Guardas anti-denormal (`DENORMAL = 1e-18`) en feedback de filter y delay.
 - Sintetiza los acordes con la **voz activa** (`this.voice`), seleccionada por
-  `selectedPad` (SAB índice 30) entre 6 voces instanciadas UNA vez en el
+  `selectedPad` (SAB índice 30) entre 5 voces instanciadas UNA vez en el
   constructor: `this.voices = PAD_CLASSES.map(Cls => new Cls(sampleRate))`
   (`PAD_CLASSES` importado de `pad-registry.js` — módulo compartido con el
   main thread). En `process()` NO hay switch por pad — solo
-  `voice.renderSample(freqs)`.
+  `voice.renderSample(renderFreqs)` con un `Float32Array` reutilizable.
 - Tercer grado ajustable mayor↔menor ANTES de renderizar:
   `third = chord[1] * 2^(-1/12)` si menor; las 3 frecuencias se pasan a la voz.
 - Envolvente por voz: cada `SynthVoice` expone `attackTime`/`releaseTime`
   (defaults importados de `constants.js` — fuente única desde la ronda de
-  limpieza). Pluck acorta `attackTime` a 2 ms (percusivo, su propia síntesis
-  ya decae). Los pasos se recalculan al cambiar de pad.
+  limpieza). Los pasos se recalculan al cambiar de pad.
 - **Hot-swap de pad sin click** (sección 9, decisión 12): al detectar cambio
   de `selectedPad` con nota sostenida, estado `QUICK_RELEASE` (release de
   8 ms) seguido de re-trigger (`noteOn()` + ATTACK con el attack de la voz
@@ -331,55 +348,34 @@ const SCALES = {
   4 Delay (feedback max 0.3, lectura con **interpolación fraccional**),
   5 Tremolo (rate suavizado per-sample, LFO con **acumulador de fase
   persistente**).
-- **LFO (Chorus/Tremolo)**: fase por acumulador incrementado por muestra
-  (`phase += 2π·rate/sampleRate`), NO derivada de `sampleIndex·rate` — la
-  derivada saltaba de fase cada vez que `rate` cambiaba, y el salto crecía
-  con el tiempo de sesión.
+- **LFO (Chorus/Tremolo)**: fase por acumulador incrementado por muestra;
+  los pasos de fase y coeficientes constantes se preparan por bloque.
+- Cuando no hay voz ni cola de delay/reverb, el worklet usa una ruta rápida de
+  silencio y no ejecuta el grafo DSP.
 - Salida: saturación suave ±0.95 + clip duro ±1.0.
 - Volumen: recibe pinchDist ya normalizado por palmLen 0–1 del tracking-worker.
 - Escribe osciloscopio: 25 muestras de `wetBuf` con step.
 
-### 8.4 `public/graphic-engine.js` — Canvas2D
-- Render loop con requestAnimationFrame.
-- **Cámara espejada**: `ctx.translate(w,0); ctx.scale(-1,1)`.
-- **Tipografía**: stack sans-serif elegante (`-apple-system, BlinkMacSystemFont,
-  "SF Pro Display", "Helvetica Neue", Arial, sans-serif`), pesos livianos
-  300–400, `letter-spacing` vía `ctx.letterSpacing` con fallback silencioso.
+### 8.4 `public/graphic-engine.js` — Canvas2D overlay
+- Render loop con `requestAnimationFrame`, limitado a 30 FPS efectivos para
+  coincidir con el tracking. El callback está preasignado y `stop()` cancela
+  su id.
+- La cámara se muestra en un `<video>` espejado por el compositor; el canvas
+  es transparente y no vuelve a copiar el frame de vídeo con `drawImage()`.
+- Contexto 2D creado con `{ alpha: true, desynchronized: true }` como hint de
+  baja latencia (el navegador puede ignorar la segunda opción).
+- Landmarks: `x = (1.0 - sabX) * w` (inversión X por espejo), usando un
+  `Float32Array(42)` reutilizable para no crear objetos por render.
 - **Osciloscopio**: franja izquierda proporcional (`max(48, min(96, w*0.08))`);
-  cada una de las 25 muestras se dibuja como una elipse "chata" (ancha > alta)
-  cuyo tamaño y opacidad siguen la amplitud de la muestra — ecualizador de
-  puntos, sin línea que las conecte. Las muestras se reparten entre un margen
-  superior e inferior (`margin = max(12, w*0.02)`, mismo ritmo que el panel
-  HUD) — no van de punta a punta de la pantalla.
-- Landmarks: `x = (1.0 - sabX) * w` (inversión X por espejo).
-- **Círculo de pinch**: radio `pow(volume, 0.55) * maxR * 1.4` con `maxR = max(60, min(120, h*0.15))`.
-  Curva exponencial: círculo crece rápido con poco movimiento de dedos y se
-  amplía más allá del rango físico entre pulgar e índice. Opacidad dinámica
-  `1 - volume*0.7` (sólido cuando pequeño, se desvanece al crecer). Borde
-  blanco siempre visible (`0.9`, 1.5 px).
-- **Tag de acorde**: tooltip anclado a la muñeca **derecha** cuadro a cuadro
-  (`float32View[35]/[36]`, invertido por espejo, offset +24px debajo de la
-  muñeca). Nombre derivado de la frecuencia real que suena (`float32View[161]`
-  vía `freqToNoteName()`) + modo maj/min + rol (lee `int32View[192+chord]` →
-  `ROLE_ENUM[index]`). Opacidad controlada por el envelope de la voz activa
-  (`float32View[166]`), se desvanece gradualmente durante el release tail.
-  `_lastChordIndex` se preserva con envelope > 0 para que el tag persista
-  mientras el sonido aún suena. Fondo `rgba(0,0,0,0.55)` con borde fino.
-  **Se dibuja siempre que `envelope > 0`, sin depender de `rightDetected`.**
-- **Panel HUD top-right**: panel semitransparente (`rgba(255,255,255,0.06)` +
-  borde `0.25`, esquinas radius 8, padding ~14px) anclado a `w - panelW - margin`
-  con `panelW = max(180, min(240, w*0.22))`. Contenido:
-  - `Efecto seleccionado: {nombre}` (título, peso 400; `titleH = 26` para que
-    no se pise con el label de la barra 1).
-  - Barra **Volumen** (pinch izquierdo normalizado, valor en %).
-  - Barra **FX Amount** (rotación izquierda `palmRot/π` → 0–1, valor en %).
-  - **FPS renderizado** (loop de rAF del GraphicEngine) y debajo
-    **FPS cámara** (lo mide `main.js` contando los `handsInstance.send()`
-    efectivos y lo pasa vía `setCameraFps()` — no hay overlay de status suelto).
-- **Resize reactivo**: `resizeCanvas()` en `window.resize` recalcula
-  `canvas.width/height` y mantiene sincronizados los índices 2–3 del SAB.
-  Todos los offsets visuales son proporcionales al tamaño real del canvas
-  (franja del osciloscopio, panel HUD, radio del círculo).
+  cada una de las 25 muestras se dibuja como una elipse "chata".
+- **Círculo de pinch**: radio `pow(volume, 0.55) * maxR * 1.4` con
+  `maxR = max(60, min(120, h*0.15))`.
+- **Tag de acorde**: tooltip anclado a la muñeca derecha cuadro a cuadro,
+  con opacidad controlada por el envelope de la voz activa.
+- **Panel HUD top-right**: panel semitransparente con pad, efecto, volumen,
+  FX Amount, FPS de render y FPS de cámara.
+- `resize` usa un listener guardado y `destroy()` lo remueve para evitar
+  fugas si se reinicia el pipeline.
 
 ### 8.5 `public/constants.js` — constantes
 - Exporta `INDEXES` (índices de TypedArray, usado en todo el código),
@@ -397,14 +393,20 @@ const SCALES = {
   botón Iniciar, indicador de carga, mensaje de error.
 - `<canvas id="main-canvas">` + `<script type="module" src="/main.js">`.
 - Estilos: fondo oscuro, botones minimalistas, sin glow.
+- El `<video class="camera-feed">` está debajo del canvas transparente y se
+  limita a la resolución/frame rate negociados por main.js.
 
 ### 8.7 `server.js` / `mime-types.js`
-- Servidor estático con COOP/COEP/CORP (sección 2).
+- Servidor estático con COOP/COEP/CORP (sección 2), streaming con
+  `createReadStream()` y sin operaciones síncronas de filesystem por request.
+- ETag/Last-Modified + `304` para código; assets vendorizados de MediaPipe
+  usan caché inmutable.
+- Brotli/gzip para HTML/JS/CSS/JSON/SVG.
 - MIME types: `.js` → `application/javascript`, `.wasm` → `application/wasm`,
   `.tflite`/`.data`/`.bin` → `application/octet-stream`. Crítico para el
   AudioWorklet y la carga de MediaPipe.
 
-### 8.8 `public/synths/` — librería de 6 pads + `pad-catalog.js`
+### 8.8 `public/synths/` — librería de 5 pads + `pad-catalog.js`
 - **`synth-voice.js`**: interfaz común `SynthVoice` (`constructor(sampleRate)`,
   `renderSample(freqs)` → muestra en [-1,1], `noteOn()`). Expone además
   `attackTime`/`releaseTime` (defaults de `constants.js`) para la envolvente
@@ -412,48 +414,26 @@ const SCALES = {
   y soft-clip — NO se duplican por synth.
 - **`polyblep.js`**: `polyBLEP(t, dt)` — corrección band-limited step que se
   RESTA de la onda naive (anti-aliasing de sierra y pulso).
-- Los 6 pads (registry `PAD_CLASSES` en audio-engine.js; **el orden es
-  sagrado**, ver gotcha sección 10):
-  1. **Sine Pad** (`sine-pad.js`) — 3 osciladores seno, el código original
-     migrado a la interfaz (comportamiento idéntico).
+- Los 5 pads actuales (registry `PAD_CLASSES`; **el orden es sagrado**, ver
+  gotcha sección 10):
+  1. **Sine Pad** (`sine-pad.js`) — 3 osciladores seno.
   2. **Saw Pad** (`saw-pad.js`) — sierra PolyBLEP (`2t-1 - polyBLEP`).
-  3. **Square Pad** (`square-pad.js`) — pulso duty 50%:
-     `square(t) = saw(t) − saw(t+0.5)`, ambos lados BLEP.
-  4. **FM Bell** (`fm-bell-pad.js`) — FM de 2 operadores: portador a la
-     frecuencia del acorde, modulador ratio fijo 2.4, índice 3.5. Parciales
-     inarmónicos de campana. ADSR global lo sostiene (solo Pluck es percusivo).
+  3. **Square Pad** (`square-pad.js`) — pulso duty 50% con BLEP.
+  4. **FM Bell** (`fm-bell-pad.js`) — FM de 2 operadores, ratio 2.4 e índice
+     3.5, con parciales inarmónicos de campana.
   5. **Wavetable** (`wavetable-pad.js`) — tabla de 2048 samples con armónicos
-     1..8 (amplitud 1/h, normalizada) pre-calculada EN el constructor; lectura
-     con interpolación lineal.
-  6. **Pluck** (`pluck-pad.js`) — Karplus-Strong: 3 delay-lines pre-alocadas
-     (longitud para ~20 Hz, la nota más grave esperada), ruido en `noteOn()`,
-     lectura fraccional (`sampleRate/freq`) para pitch exacto, feedback
-     `0.5·(read + next)·decay` con `decay = 0.9997` (cola ~0.5 s). Ataque
-     propio percusivo: `attackTime = 2 ms` (el ADSR global de 80 ms aplastaría
-     el ataque); el RELEASE global sigue cortando la nota al abrir la mano.
-- **`pad-registry.js`**: registro compartido `PAD_CLASSES` (las 6 clases, sin
+     1..8, pre-calculada en el constructor y leída con interpolación lineal.
+- **`pad-registry.js`**: registro compartido `PAD_CLASSES` (las 5 clases, sin
   APIs de browser) — lo importa audio-engine.js para instanciar las voces y
-  main.js para el preview de la intro. Mismo invariante de orden que el
-  catálogo (sección 10).
+  main.js para el preview de la intro.
 - **`pad-catalog.js`**: SOLO metadata (`{id, name, description}`) sin lógica
-  de audio — importable desde el main thread. `PAD_CATALOG[i].id === i` DEBE
-  coincidir con la posición en `PAD_CLASSES` (gotcha sección 10).
-- **Librería en la intro** (index.html + main.js): sección "Librería de pads"
-  con el mismo patrón UI que escala/tónica (`buildButtonGroup` + `.sel-btn`);
-  la selección se escribe al SAB índice 30 (`CONFIG_SELECTED_PAD`) en
-  `writeConfigToSAB()`. El HUD (graphic-engine `drawDataBars`) muestra la
-  línea "Pad: {nombre}" arriba de "Efecto: {nombre}" (título de 2 líneas,
-  `titleH = 44`).
-- **Preview de sonido en la intro** (main.js `playPadPreview`): al pasar el
-  mouse o hacer click sobre un pad, renderiza ~1 s de la tríada C4 con la
-  MISMA clase del registry (`PAD_CLASSES[padIdx]` — sin drift con el worklet)
-  en un `AudioBuffer` y lo reproduce con `AudioBufferSourceNode`. Fade-in
-  sigue el ataque propio de la voz (Pluck 4 ms, sostenidos hasta 50 ms) +
-  fade-out 150 ms — sin clicks. El primer click reanuda el AudioContext
-  (hover solo suena después de una activación). `stopPreview()` cierra el
-  contexto al pulsar Iniciar (el app principal usa su propio AudioContext).
-
----
+  de audio — `PAD_CATALOG[i].id === i` DEBE coincidir con la posición en
+  `PAD_CLASSES`.
+- **Librería en la intro**: la selección se escribe al SAB índice 30
+  (`CONFIG_SELECTED_PAD`) en `writeConfigToSAB()`. El HUD muestra pad y efecto.
+- **Preview de sonido**: `playPadPreview` renderiza aproximadamente un segundo
+  una sola vez por pad y cachea el `AudioBuffer`; `stopPreview()` libera el
+  contexto y la caché al iniciar el pipeline principal.
 
 ## 9. Decisiones de diseño (no revertir sin consultar)
 
@@ -483,9 +463,10 @@ const SCALES = {
     con el attack de la voz nueva, NO el ADSR completo 80/150 ms — cambia de
     timbre sin discontinuidad audible. Sin nota sostenida, el switch es
     directo (silencioso).
-13. **Solo Pluck es percusivo** (attack 2 ms): Sine/Saw/Square/FM/Wavetable
-    usan el ADSR global. No se asume "una talla sirve para todos" — cada voz
-    expone su propia envolvente y el resto usa el default de constants.js.
+13. El AudioWorklet no crea arrays u objetos en `process()`; los buffers,
+    frecuencias y coeficientes se preparan fuera del loop de muestras.
+14. La página oculta suspende audio, vídeo, tracking y gráficos; `destroy()`
+    remueve listeners para que reiniciar no acumule recursos.
 
 ---
 
@@ -508,11 +489,12 @@ const SCALES = {
   inclinación de la muñeca izquierda (`leftPalmRot/π`). Con la mano en reposo,
   cualquier efecto suena 100% seco sin importar si el algoritmo funciona —
   no confundir con un efecto roto; subir `mix` antes de juzgar al oído.
-- **`id` de `PAD_CATALOG` ↔ posición en `PAD_CLASSES`**: el orden de las 6
-  clases en el registry de audio-engine.js ES el contrato. El `id` de cada
-  entrada del catálogo debe coincidir exactamente (0-5 en orden). Editar un
-  lado sin el otro desincroniza la UI de la intro con el motor de audio —
-  mismo tipo de invariante manual que ya causó bugs con los índices del SAB.
+- **`id` de `PAD_CATALOG` ↔ posición en `PAD_CLASSES`**: el orden de las 5
+  clases actuales en el registry de audio-engine.js ES el contrato. El `id`
+  de cada entrada del catálogo debe coincidir exactamente (0-4 en orden).
+  Editar un lado sin el otro desincroniza la UI de la intro con el motor de
+  audio — mismo tipo de invariante manual que ya causó bugs con los índices
+  del SAB.
 - **`selectedPad` comparte bytes con `float32View[30]`** (vistas int32/float32
   del mismo SAB): escribir el pad como int32 y nunca leerlo como float.
 
@@ -522,37 +504,16 @@ const SCALES = {
 
 ### Verificado (nivel código, sin cámara)
 
-- Servidor arranca y sirve con headers COOP/COEP correctos (HTTP 200).
-- Todos los archivos pasan `node --check` (sintaxis válida) y los módulos ES
-  importan limpiamente.
-- MIME types correctos para JS/WASM/TFLite (probados con Invoke-WebRequest).
-- **Delay**: interpolación fraccional verificada empíricamente con test de
-  impulso unitario en Node (réplica exacta de `fxDelay()`):
-  - frac=0.5 → eco repartido 0.5/0.5 entre las dos muestras enteras.
-  - frac=0 → eco de muestra completa única en la posición esperada.
-  - frac=0.25 → energía 0.75/0.25 entre muestras adyacentes (dirección correcta).
-- DSP de Chorus/Tremolo (acumulador de fase) y Filter (coeficiente one-pole +
-  cutoff logarítmico) verificados línea por línea; matemática correcta.
-- **6 pads de synth** verificados con test de render en Node (réplica exacta
-  del uso real, `tmp/synth-render-test.js`):
-  - Los 6 implementan `SynthVoice` y exponen envolvente > 0.
-  - Salida acotada |x| < 1.2 y con energía (rms > 0.05) en los 6.
-  - **Pitch 440 Hz por autocorrelación**: Sine/Saw/Square/Wavetable/Pluck
-    → ~440.4 Hz; FM Bell → autocorrelación con pico fuerte (parciales
-    inarmónicos, no se mide con cruces por cero).
-  - **Anti-aliasing**: max diff muestra a muestra < 1.5 en todos (sierra/pulso
-    naive saltarían ~2.0; con PolyBLEP la transición se reparte en 2 muestras).
-  - **Pluck**: ataque propio 2 ms; decae solo (rms final < 85% del inicial en
-    1 s — Karplus-Strong decae por PERIODO, ~0.5 s de cola es lo correcto);
-    arranca con energía inmediata.
-  - `node --check` en los 13 archivos JS tocados + imports ES OK en Node +
-    servidor sirviendo `/synths/*.js` y `/pad-catalog.js` como
-    `application/javascript` (verificado en vivo).
-  - **Preview de la intro** verificado con test de buffer en Node
-    (`tmp/preview-test.js`, réplica exacta de `playPadPreview`): los 6 pads
-    → buffer acotado ≤ 0.5, con energía (el Pluck es más bajo en RMS por ser
-    percusivo: pico fuerte + cola), sin clicks al inicio (env=0) ni al final
-    (fade-out).
+- `npm test` pasa `test/performance-smoke.mjs`: AudioWorklet en silencio y con
+  acorde, worker leyendo slots SAB y publicación de flags/landmarks, además
+  de invariantes estáticos de zero-allocation y servidor.
+- Todos los archivos pasan `node --check`.
+- El servidor arranca, conserva COOP/COEP/CORP, entrega `Content-Length` para
+  binarios, `Content-Encoding: br` para JS, y responde `304` con ETag.
+- El audio mantiene buffers/frecuencias/coeficientes preasignados, bypass de
+  efectos con `mix` bajo y ruta rápida cuando no hay voz ni cola.
+- El tracking ya no clona arrays de landmarks: los datos viajan por tres
+  slots del SAB y el worker descarta tokens obsoletos.
 
 ### Pendiente de prueba manual (requiere cámara)
 
@@ -570,13 +531,10 @@ Checklist final, con todos los fixes de rondas anteriores ya aplicados:
       cambios de parámetro percibidos como continuos.
 - [ ] Las 6 escalas × 12 tónicas — al menos una pasada rápida, sin
       frecuencias erróneas.
-- [ ] Los 6 pads individualmente (Sine, Saw, Square, FM Bell, Wavetable,
-      Pluck) — timbres claramente distintos, sin clicks ni aliasing áspero
-      (especialmente Saw/Square, por BLEP).
+- [ ] Los 5 pads individualmente (Sine, Saw, Square, FM Bell, Wavetable) —
+      timbres claramente distintos, sin clicks ni aliasing áspero.
 - [ ] Hot-swap de pad con nota sostenida — cambio sin click ni
       discontinuidad audible (re-trigger rápido de 8 ms).
-- [ ] Pluck: ataque percusivo natural y cola que decae sola (~0.5 s), no un
-      pad sostenido; FM Bell suena metálico, no un seno con chorus.
 
 > El historial detallado de bugs por ronda se conserva en `CHANGELOG.md`.
 

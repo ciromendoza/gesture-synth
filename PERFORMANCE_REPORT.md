@@ -2,7 +2,7 @@
 
 **Fecha:** 2026-08-08  
 **Alcance:** análisis estático del cliente, AudioWorklet, worker de tracking y servidor estático.  
-**Estado:** no se modificó el runtime; este documento contiene hallazgos y una propuesta de roadmap.
+**Estado:** los hallazgos P0/P1 principales se implementaron en la ronda siguiente; este documento conserva el diagnóstico original y el roadmap.
 
 ## Resumen ejecutivo
 

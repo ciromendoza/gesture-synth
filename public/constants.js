@@ -1,6 +1,21 @@
 // SharedArrayBuffer Total Size
 export const SAB_TOTAL_SIZE = 2048;
 
+// Tracking input slots live in the previously reserved SAB area. Each slot
+// contains a sequence number, two presence flags and 84 float32 coordinates
+// (21 x/y landmarks for each hand). The main thread writes one slot and sends
+// only a tiny control message; the worker reads the actual data from SAB.
+export const TRACKING_INPUT = {
+  SLOT_SIZE: 87,
+  SLOT_COUNT: 3,
+  SEQUENCE: 0,
+  RIGHT_PRESENT: 1,
+  LEFT_PRESENT: 2,
+  RIGHT_LANDMARKS: 3,
+  LEFT_LANDMARKS: 45,
+  SLOTS: [198, 285, 372]
+};
+
 // TypedArray Index offsets (ByteOffset / 4)
 export const INDEXES = {
   CONFIG_SAMPLE_RATE: 0,
@@ -14,7 +29,7 @@ export const INDEXES = {
   CONFIG_MIN_DETECTION_CONF: 8,
   CONFIG_SELECTED_EFFECT: 10,
   CONFIG_ROOT_NOTE: 29,  // after 6 chord frequencies (float32 11–28)
-  CONFIG_SELECTED_PAD: 30, // 0–5, posición en PAD_CLASSES (ver pad-catalog.js)
+  CONFIG_SELECTED_PAD: 30, // 0–4, posición en PAD_CLASSES (ver pad-catalog.js)
 
   RIGHT_HAND_DETECTED: 32,
   RIGHT_FINGER_COUNT: 33,

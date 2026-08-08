@@ -2,7 +2,7 @@
 import { GraphicEngine } from './graphic-engine.js';
 import { PAD_CATALOG } from './pad-catalog.js';
 import { PAD_CLASSES } from './pad-registry.js';
-import { ROLE_ENUM } from './constants.js';
+import { ROLE_ENUM, SAB_TOTAL_SIZE, TRACKING_INPUT } from './constants.js';
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 const startScreen = document.getElementById('start-screen');
@@ -15,8 +15,22 @@ const canvas = document.getElementById('main-canvas');
 let sab = null, int32View = null, float32View = null;
 let trackingWorker = null, audioContext = null, audioNode = null;
 let graphicEngine = null, videoStream = null, videoElement = null;
-let frameRAFId = null, isRunning = false;
+let frameRAFId = null, videoFrameCallbackId = null, isRunning = false;
 let handsInstance = null, lastHandResults = null;
+let mediaPipeScriptPromise = null;
+let trackingFrameSequence = 0, trackingSlotCursor = 0;
+let inferenceInFlight = false;
+
+const TRACKING_FPS = 30;
+const CAMERA_WIDTH = 640;
+const CAMERA_HEIGHT = 480;
+const requestedTrackingQuality = new URLSearchParams(window.location.search).get('tracking');
+const lowPowerDevice = (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4) ||
+  (navigator.deviceMemory && navigator.deviceMemory <= 4);
+// Full is retained on desktop by default; ?tracking=lite opts into the much
+// cheaper model, and low-power devices choose it automatically.
+const TRACKING_MODEL_COMPLEXITY = requestedTrackingQuality === 'full' ? 1 :
+  (requestedTrackingQuality === 'lite' || lowPowerDevice ? 0 : 1);
 
 // ─── Music Theory Data ───────────────────────────────────────────────────────
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
@@ -84,29 +98,35 @@ buildButtonGroup('pad-grid', PAD_CATALOG.map(p => p.name), 0, (i) => { userConfi
 // se escucha en la intro y lo que suena al iniciar.
 const PREVIEW_FREQS = [261.63, 329.63, 392.00]; // C4 mayor — tríada de prueba
 let previewCtx = null, previewNode = null;
+const previewBuffers = [];
 
 function playPadPreview(padIdx) {
   const Cls = PAD_CLASSES[padIdx];
   if (!Cls) return;
-  if (!previewCtx) previewCtx = new AudioContext({ sampleRate: 48000 });
+  if (!previewCtx) previewCtx = new AudioContext();
   if (previewCtx.state === 'suspended') previewCtx.resume().catch(() => {}); // hover no activa; el primer click sí
-  const sr = previewCtx.sampleRate;
-  const voice = new Cls(sr);
-  voice.noteOn();
 
-  const DUR = 1.0;
-  const N = Math.floor(DUR * sr);
-  // Fade-in siguiendo el ataque propio de la voz (hasta 50 ms) +
-  // fade-out de 150 ms — sin clicks al cortar.
-  const fadeIn = Math.min(Math.floor(0.05 * sr), Math.max(1, Math.floor(voice.attackTime * 2 * sr)));
-  const fadeOut = Math.floor(0.15 * sr);
-  const buf = previewCtx.createBuffer(1, N, sr);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < N; i++) {
-    let s = voice.renderSample(PREVIEW_FREQS);
-    const env = i < fadeIn ? i / fadeIn : i > N - fadeOut ? Math.max(0, (N - i) / fadeOut) : 1;
-    s = Math.max(-1, Math.min(1, s * env)) * 0.5;
-    data[i] = s;
+  let buf = previewBuffers[padIdx];
+  if (!buf) {
+    const sr = previewCtx.sampleRate;
+    const voice = new Cls(sr);
+    voice.noteOn();
+
+    const DUR = 1.0;
+    const N = Math.floor(DUR * sr);
+    // Fade-in siguiendo el ataque propio de la voz (hasta 50 ms) +
+    // fade-out de 150 ms — sin clicks al cortar.
+    const fadeIn = Math.min(Math.floor(0.05 * sr), Math.max(1, Math.floor(voice.attackTime * 2 * sr)));
+    const fadeOut = Math.floor(0.15 * sr);
+    buf = previewCtx.createBuffer(1, N, sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < N; i++) {
+      let s = voice.renderSample(PREVIEW_FREQS);
+      const env = i < fadeIn ? i / fadeIn : i > N - fadeOut ? Math.max(0, (N - i) / fadeOut) : 1;
+      s = Math.max(-1, Math.min(1, s * env)) * 0.5;
+      data[i] = s;
+    }
+    previewBuffers[padIdx] = buf;
   }
 
   if (previewNode) { try { previewNode.stop(); } catch (e) {} previewNode = null; }
@@ -126,6 +146,7 @@ document.querySelectorAll('#pad-grid .sel-btn').forEach((btn, i) => {
 
 function stopPreview() {
   if (previewNode) { try { previewNode.stop(); } catch (e) {} previewNode = null; }
+  previewBuffers.length = 0;
   if (previewCtx) { previewCtx.close().catch(() => {}); previewCtx = null; }
 }
 
@@ -166,15 +187,20 @@ async function initialize() {
     // Camera
     loadingIndicator.querySelector('span').textContent = 'Solicitando cámara...';
     videoStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      video: {
+        width: { ideal: CAMERA_WIDTH, max: CAMERA_WIDTH },
+        height: { ideal: CAMERA_HEIGHT, max: CAMERA_HEIGHT },
+        frameRate: { ideal: TRACKING_FPS, max: TRACKING_FPS },
+        facingMode: 'user'
+      },
       audio: false
     });
 
     // SAB
-    sab = new SharedArrayBuffer(2048);
+    sab = new SharedArrayBuffer(SAB_TOTAL_SIZE);
     int32View = new Int32Array(sab);
     float32View = new Float32Array(sab);
-    writeConfigToSAB();
+    writeConfigToSAB(videoStream.getVideoTracks()[0]?.getSettings());
 
     // MediaPipe
     loadingIndicator.querySelector('span').textContent = 'Cargando MediaPipe...';
@@ -195,7 +221,9 @@ async function initialize() {
 
     // Audio
     loadingIndicator.querySelector('span').textContent = 'Inicializando audio...';
-    audioContext = new AudioContext({ sampleRate: 48000 });
+    // Let the browser use the native output rate; the synth reads the actual
+    // AudioWorklet sampleRate and avoids an unnecessary resampling stage.
+    audioContext = new AudioContext();
     int32View[0] = audioContext.sampleRate;
     await audioContext.audioWorklet.addModule('/audio-engine.js');
     audioNode = new AudioWorkletNode(audioContext, 'gesture-synthesizer', {
@@ -223,19 +251,19 @@ async function initialize() {
 }
 
 // ─── Write config to SAB ────────────────────────────────────────────────────
-function writeConfigToSAB() {
-  int32View[0] = 48000;         // sampleRate
+function writeConfigToSAB(cameraSettings = {}) {
+  int32View[0] = 48000;         // sampleRate (replaced with the actual AudioContext rate)
   int32View[1] = 128;           // bufferSize
   int32View[2] = window.innerWidth;
   int32View[3] = window.innerHeight;
-  int32View[4] = 640;           // cameraWidth
-  int32View[5] = 480;           // cameraHeight
+  int32View[4] = cameraSettings.width || CAMERA_WIDTH;
+  int32View[5] = cameraSettings.height || CAMERA_HEIGHT;
   int32View[6] = 2;             // maxHands
-  int32View[7] = 1;             // modelComplexity
+  int32View[7] = TRACKING_MODEL_COMPLEXITY;
   int32View[8] = 500;           // minDetectionConf
   int32View[9] = 500;           // minTrackingConf
   int32View[10] = userConfig.effect; // selectedEffect
-  int32View[30] = userConfig.pad;    // selectedPad (0–5, posición en PAD_CLASSES)
+  int32View[30] = userConfig.pad;    // selectedPad (0–4, posición en PAD_CLASSES)
 
   // Write 6 chord frequencies to SAB config zone (float32 index 11–28)
   // Root note moved to index 29 (after 6×3=18 floats)
@@ -254,27 +282,44 @@ function writeConfigToSAB() {
     int32View[192 + c] = ROLE_ENUM.indexOf(roles[c]);
   }
 
-  int32View[32] = 0;  // RIGHT_HAND_DETECTED
-  int32View[96] = 0;  // LEFT_HAND_DETECTED
+  for (const slot of TRACKING_INPUT.SLOTS) {
+    Atomics.store(int32View, slot + TRACKING_INPUT.SEQUENCE, 0);
+    Atomics.store(int32View, slot + TRACKING_INPUT.RIGHT_PRESENT, 0);
+    Atomics.store(int32View, slot + TRACKING_INPUT.LEFT_PRESENT, 0);
+  }
+  trackingFrameSequence = 0;
+  trackingSlotCursor = 0;
+
+  Atomics.store(int32View, 32, 0);  // RIGHT_HAND_DETECTED
+  Atomics.store(int32View, 96, 0);  // LEFT_HAND_DETECTED
   int32View[162] = -1; // AUDIO_ACTIVE_CHORD_INDEX
 }
 
 // ─── MediaPipe ───────────────────────────────────────────────────────────────
 function loadMediaPipeHands() {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = '/lib/mediapipe/hands.js';
-    s.onload = async () => {
-      try {
-        handsInstance = new self.Hands({ locateFile: (f) => `/lib/mediapipe/${f}` });
-        handsInstance.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
-        handsInstance.onResults((r) => { lastHandResults = r; });
-        await handsInstance.initialize();
-        resolve();
-      } catch (e) { reject(e); }
-    };
-    s.onerror = () => reject(new Error('Failed to load MediaPipe'));
-    document.head.appendChild(s);
+  if (!mediaPipeScriptPromise) {
+    mediaPipeScriptPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = '/lib/mediapipe/hands.js';
+      s.onload = resolve;
+      s.onerror = () => {
+        mediaPipeScriptPromise = null;
+        reject(new Error('Failed to load MediaPipe'));
+      };
+      document.head.appendChild(s);
+    });
+  }
+
+  return mediaPipeScriptPromise.then(async () => {
+    handsInstance = new self.Hands({ locateFile: (f) => `/lib/mediapipe/${f}` });
+    handsInstance.setOptions({
+      maxNumHands: 2,
+      modelComplexity: TRACKING_MODEL_COMPLEXITY,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    handsInstance.onResults((r) => { lastHandResults = r; });
+    await handsInstance.initialize();
   });
 }
 
@@ -284,60 +329,174 @@ function setupVideoCapture() {
   videoElement.srcObject = videoStream;
   videoElement.playsInline = true;
   videoElement.muted = true;
-  videoElement.style.display = 'none';
+  videoElement.className = 'camera-feed';
+  videoElement.setAttribute('aria-hidden', 'true');
   document.body.appendChild(videoElement);
   videoElement.play().catch(() => {});
 }
 
-// ─── Frame loop ──────────────────────────────────────────────────────────────
+// ─── Tracking frame loop ────────────────────────────────────────────────────
+// MediaPipe is driven by real video frames when the browser supports
+// requestVideoFrameCallback(). The fallback uses rAF but never sends the same
+// video timestamp twice and never allows two inferences in flight.
 function startFrameLoop() {
-  let lastT = 0;
-  const INTERVAL = 1000 / 30;
+  stopFrameLoop();
+  let lastVideoTime = -1;
   let camFrameCount = 0;
   let camFpsTimer = performance.now();
 
-  async function tick(ts) {
-    if (!isRunning) return;
-    if (ts - lastT >= INTERVAL && videoElement?.readyState >= 2 && handsInstance) {
-      lastT = ts;
-      try {
-        await handsInstance.send({ image: videoElement });
-        camFrameCount++;
-        const r = lastHandResults;
-        let rh = null, lh = null;
-        if (r?.multiHandLandmarks && r?.multiHandedness) {
-          for (let i = 0; i < r.multiHandLandmarks.length; i++) {
-            if (r.multiHandedness[i].label === 'Right') rh = r.multiHandLandmarks[i];
-            else lh = r.multiHandLandmarks[i];
-          }
+  const publishCameraFps = (now) => {
+    if (now - camFpsTimer < 1000) return;
+    const camFps = Math.round((camFrameCount * 1000) / (now - camFpsTimer));
+    camFrameCount = 0;
+    camFpsTimer = now;
+    graphicEngine?.setCameraFps(camFps);
+  };
+
+  const inferCurrentFrame = async (videoTime) => {
+    if (!isRunning || !handsInstance || !videoElement || videoElement.readyState < 2) return;
+    if (inferenceInFlight || videoTime === lastVideoTime) return;
+    lastVideoTime = videoTime;
+    inferenceInFlight = true;
+    try {
+      await handsInstance.send({ image: videoElement });
+      const r = lastHandResults;
+      let rh = null;
+      let lh = null;
+      if (r?.multiHandLandmarks && r?.multiHandedness) {
+        for (let i = 0; i < r.multiHandLandmarks.length; i++) {
+          if (r.multiHandedness[i].label === 'Right') rh = r.multiHandLandmarks[i];
+          else lh = r.multiHandLandmarks[i];
         }
-        trackingWorker?.postMessage({ type: 'landmarks', rightHand: rh, leftHand: lh });
-      } catch (e) {}
+      }
+      publishLandmarksToSAB(rh, lh);
+      camFrameCount++;
+      publishCameraFps(performance.now());
+    } catch (e) {
+      // A transient camera/model error should not kill the render loop or leave
+      // a stale chord held in the audio engine.
+      publishLandmarksToSAB(null, null);
+    } finally {
+      inferenceInFlight = false;
     }
-    // Camera FPS, once per second — feeds the HUD panel in graphic-engine
-    if (ts - camFpsTimer >= 1000) {
-      const camFps = Math.round((camFrameCount * 1000) / (ts - camFpsTimer));
-      camFrameCount = 0;
-      camFpsTimer = ts;
-      graphicEngine?.setCameraFps(camFps);
+  };
+
+  const scheduleVideoFrame = () => {
+    if (!isRunning || !videoElement) return;
+    if (typeof videoElement.requestVideoFrameCallback === 'function') {
+      videoFrameCallbackId = videoElement.requestVideoFrameCallback((_, metadata) => {
+        const mediaTime = metadata?.mediaTime ?? videoElement.currentTime;
+        inferCurrentFrame(mediaTime).finally(scheduleVideoFrame);
+      });
+      return;
     }
+
+    const tick = () => {
+      if (!isRunning) return;
+      const mediaTime = videoElement.currentTime;
+      inferCurrentFrame(mediaTime).finally(() => {
+        frameRAFId = requestAnimationFrame(tick);
+      });
+    };
     frameRAFId = requestAnimationFrame(tick);
+  };
+
+  scheduleVideoFrame();
+}
+
+function stopFrameLoop() {
+  if (frameRAFId !== null) {
+    cancelAnimationFrame(frameRAFId);
+    frameRAFId = null;
   }
-  frameRAFId = requestAnimationFrame(tick);
+  if (videoFrameCallbackId !== null && videoElement?.cancelVideoFrameCallback) {
+    videoElement.cancelVideoFrameCallback(videoFrameCallbackId);
+    videoFrameCallbackId = null;
+  }
+}
+
+function publishLandmarksToSAB(rightHand, leftHand) {
+  if (!int32View || !trackingWorker) return;
+
+  const slot = TRACKING_INPUT.SLOTS[trackingSlotCursor];
+  trackingSlotCursor = (trackingSlotCursor + 1) % TRACKING_INPUT.SLOT_COUNT;
+  const sequence = ++trackingFrameSequence;
+  const sequenceIndex = slot + TRACKING_INPUT.SEQUENCE;
+  const rightPresentIndex = slot + TRACKING_INPUT.RIGHT_PRESENT;
+  const leftPresentIndex = slot + TRACKING_INPUT.LEFT_PRESENT;
+
+  // Negative marks the slot as being written. The worker only accepts the
+  // positive sequence after every coordinate and presence flag is published.
+  Atomics.store(int32View, sequenceIndex, -sequence);
+  Atomics.store(int32View, rightPresentIndex, rightHand ? 1 : 0);
+  Atomics.store(int32View, leftPresentIndex, leftHand ? 1 : 0);
+  copyLandmarksToSAB(rightHand, slot + TRACKING_INPUT.RIGHT_LANDMARKS);
+  copyLandmarksToSAB(leftHand, slot + TRACKING_INPUT.LEFT_LANDMARKS);
+  Atomics.store(int32View, sequenceIndex, sequence);
+
+  // Only the slot/sequence token is cloned; the 84 landmark coordinates stay
+  // in the shared buffer. A stale token is discarded by the worker.
+  trackingWorker.postMessage({ type: 'frame', slot, sequence });
+}
+
+function copyLandmarksToSAB(landmarks, offset) {
+  for (let i = 0; i < 42; i += 2) {
+    const point = landmarks?.[i / 2];
+    float32View[offset + i] = point?.x || 0;
+    float32View[offset + i + 1] = point?.y || 0;
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function showError(msg) { errorMsg.textContent = msg; errorMsg.style.display = 'block'; }
 
+function resetGestureState() {
+  if (!int32View) return;
+  Atomics.store(int32View, 32, 0);
+  Atomics.store(int32View, 96, 0);
+  int32View[33] = 0;
+  int32View[97] = 0;
+}
+
+async function pauseForHiddenPage() {
+  if (!isRunning) return;
+  stopFrameLoop();
+  resetGestureState();
+  videoElement?.pause();
+  graphicEngine?.stop();
+  if (audioContext?.state === 'running') {
+    try { await audioContext.suspend(); } catch (e) {}
+  }
+}
+
+async function resumeVisiblePage() {
+  if (!isRunning) return;
+  try { await videoElement?.play(); } catch (e) {}
+  if (audioContext?.state === 'suspended') {
+    try { await audioContext.resume(); } catch (e) {}
+  }
+  graphicEngine?.start();
+  startFrameLoop();
+}
+
 function cleanup() {
-  if (frameRAFId) { cancelAnimationFrame(frameRAFId); frameRAFId = null; }
+  stopFrameLoop();
+  resetGestureState();
   if (videoStream) { videoStream.getTracks().forEach(t => t.stop()); videoStream = null; }
   if (videoElement) { videoElement.remove(); videoElement = null; }
   if (trackingWorker) { trackingWorker.terminate(); trackingWorker = null; }
   if (audioNode) { audioNode.disconnect(); audioNode = null; }
   if (audioContext?.state !== 'closed') { audioContext?.close(); audioContext = null; }
-  if (graphicEngine) { graphicEngine.stop(); graphicEngine = null; }
+  if (graphicEngine) { graphicEngine.destroy(); graphicEngine = null; }
+  if (handsInstance?.close) { handsInstance.close().catch(() => {}); }
   handsInstance = null;
+  lastHandResults = null;
+  isRunning = false;
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) pauseForHiddenPage();
+  else resumeVisiblePage();
+});
 
 window.addEventListener('beforeunload', () => { isRunning = false; cleanup(); });

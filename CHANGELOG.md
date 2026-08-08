@@ -180,3 +180,31 @@ Sin bugs de código: cierre de verificación + deuda técnica.
   límite 45°.
 - **BUG 4 — DSP crackling**: guards anti-denormal, ganancia de reverb,
   salida de delay.
+
+## Ronda 9 — Performance pipeline y zero-allocation (2026-08-08)
+
+- **AudioWorklet**: eliminadas las asignaciones de `readChords()` y de
+  `freqs` por muestra; las frecuencias, coeficientes DSP y buffers se
+  reutilizan. Reverb, filter y bitcrush preparan sus coeficientes por bloque.
+- **Audio silencioso**: bypass de efectos cuando `mix` es insignificante y
+  ruta rápida cuando no hay voz ni cola de delay/reverb.
+- **Tracking**: landmarks escritos en tres slots del SAB con secuencia y
+  doble validación; `postMessage` transporta solo `{slot, sequence}` y el
+  worker descarta frames obsoletos.
+- **Scheduling**: `requestVideoFrameCallback()` cuando está disponible,
+  fallback con timestamp de vídeo, una sola inferencia en vuelo y cámara
+  limitada a 640×480/30 FPS. `?tracking=lite` activa el modelo Lite y los
+  dispositivos de bajo consumo lo seleccionan automáticamente.
+- **Render**: vídeo separado en una capa del compositor y canvas transparente
+  de overlays limitado a 30 FPS; landmarks usan un `Float32Array` reutilizable.
+  El listener de resize se libera en `destroy()`.
+- **Lifecycle**: pausa de cámara/audio/tracking al ocultar la página, cierre de
+  MediaPipe y limpieza de listeners al detener el pipeline. Los previews se
+  cachean una vez por pad.
+- **Servidor**: streaming asíncrono, ETag/Last-Modified, respuestas 304,
+  caché inmutable para MediaPipe y Brotli/gzip para recursos textuales.
+- **Verificación**: nuevo `npm test` con smoke tests de AudioWorklet, worker SAB
+  e invariantes estáticos.
+- **Documentación**: el estado real del repositorio contiene 5 pads (Sine,
+  Saw, Square, FM Bell y Wavetable); se corrigieron referencias antiguas a un
+  sexto pad/Pluck que no existe en el código actual.
