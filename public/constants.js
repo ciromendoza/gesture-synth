@@ -55,6 +55,9 @@ export const INDEXES = {
   AUDIO_ENVELOPE_STATE: 166,
   AUDIO_OSCILLOSCOPE_BUFFER: 167,
   AUDIO_SEVENTH_ACTIVE: 465, // int32; written by AudioWorklet for HUD/tag
+  PERF_AUDIO_CALLBACK_MS: 466, // float32; sampled callback duration
+  PERF_AUDIO_CALLBACK_BUDGET_MS: 467, // float32; quantum duration
+  PERF_AUDIO_CALLBACK_COUNT: 468, // int32; sampled callback count
 
   RESERVED_CHORD_ROLES: 459  // int32 × 6 (459–464): role index for each chord
 };

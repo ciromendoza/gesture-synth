@@ -1,5 +1,6 @@
 // main.js — Orchestrator
 import { GraphicEngine } from './graphic-engine.js';
+import { PerformanceMonitor } from './performance-monitor.js';
 import { PAD_CATALOG } from './pad-catalog.js';
 import { PAD_CLASSES } from './pad-registry.js';
 import { INDEXES, ROLE_ENUM, SAB_TOTAL_SIZE, TRACKING_INPUT } from './constants.js';
@@ -10,6 +11,12 @@ const startBtn = document.getElementById('start-btn');
 const errorMsg = document.getElementById('error-msg');
 const loadingIndicator = document.getElementById('loading-indicator');
 const canvas = document.getElementById('main-canvas');
+const performanceMonitor = new PerformanceMonitor();
+
+// DevTools-friendly diagnostics. Call `gestureSynthPerformance()` in the
+// console after a session (ideally 60s) to retrieve p50/p95/p99 metrics.
+window.gestureSynthPerformance = () => performanceMonitor.snapshot();
+window.gestureSynthPerformance.reset = () => performanceMonitor.reset();
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let sab = null, int32View = null, float32View = null;
@@ -176,6 +183,7 @@ startBtn.addEventListener('click', () => initialize());
 
 async function initialize() {
   stopPreview(); // el app principal arranca su propio AudioContext — no solapar
+  performanceMonitor.reset();
 
   if (typeof SharedArrayBuffer === 'undefined') {
     showError('SharedArrayBuffer no disponible. Headers COOP/COEP requeridos.');
@@ -228,6 +236,7 @@ async function initialize() {
     // AudioWorklet sampleRate and avoids an unnecessary resampling stage.
     audioContext = new AudioContext();
     int32View[0] = audioContext.sampleRate;
+    performanceMonitor.setAudioContext(audioContext, sab);
     await audioContext.audioWorklet.addModule('/audio-engine.js');
     audioNode = new AudioWorkletNode(audioContext, 'gesture-synthesizer', {
       processorOptions: { sab }
@@ -237,7 +246,7 @@ async function initialize() {
     // Video + Graphic
     loadingIndicator.querySelector('span').textContent = 'Iniciando video...';
     setupVideoCapture();
-    graphicEngine = new GraphicEngine(canvas, sab, videoElement);
+    graphicEngine = new GraphicEngine(canvas, sab, videoElement, performanceMonitor);
     graphicEngine.start();
 
     canvas.classList.add('active');
@@ -356,6 +365,7 @@ function startFrameLoop() {
     const camFps = Math.round((camFrameCount * 1000) / (now - camFpsTimer));
     camFrameCount = 0;
     camFpsTimer = now;
+    performanceMonitor.setCameraFps(camFps);
     graphicEngine?.setCameraFps(camFps);
   };
 
@@ -364,8 +374,11 @@ function startFrameLoop() {
     if (inferenceInFlight || videoTime === lastVideoTime) return;
     lastVideoTime = videoTime;
     inferenceInFlight = true;
+    const inferenceStartedAt = performance.now();
+    let inferenceSucceeded = false;
     try {
       await handsInstance.send({ image: videoElement });
+      inferenceSucceeded = true;
       const r = lastHandResults;
       let rh = null;
       let lh = null;
@@ -376,6 +389,7 @@ function startFrameLoop() {
         }
       }
       publishLandmarksToSAB(rh, lh);
+      performanceMonitor.recordProcessedFrame();
       camFrameCount++;
       publishCameraFps(performance.now());
     } catch (e) {
@@ -383,6 +397,8 @@ function startFrameLoop() {
       // a stale chord held in the audio engine.
       publishLandmarksToSAB(null, null);
     } finally {
+      performanceMonitor.recordInference(performance.now() - inferenceStartedAt);
+      if (!inferenceSucceeded) performanceMonitor.recordInferenceError();
       inferenceInFlight = false;
     }
   };
@@ -392,6 +408,7 @@ function startFrameLoop() {
     if (typeof videoElement.requestVideoFrameCallback === 'function') {
       videoFrameCallbackId = videoElement.requestVideoFrameCallback((_, metadata) => {
         const mediaTime = metadata?.mediaTime ?? videoElement.currentTime;
+        performanceMonitor.recordVideoFrame(metadata?.presentedFrames ?? mediaTime);
         inferCurrentFrame(mediaTime).finally(scheduleVideoFrame);
       });
       return;
@@ -400,6 +417,7 @@ function startFrameLoop() {
     const tick = () => {
       if (!isRunning) return;
       const mediaTime = videoElement.currentTime;
+      performanceMonitor.recordVideoFrame(mediaTime);
       inferCurrentFrame(mediaTime).finally(() => {
         frameRAFId = requestAnimationFrame(tick);
       });

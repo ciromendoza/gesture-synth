@@ -2,7 +2,7 @@
 
 **Fecha:** 2026-08-08  
 **Alcance:** análisis estático del cliente, AudioWorklet, worker de tracking y servidor estático.  
-**Estado:** los hallazgos P0/P1 principales se implementaron en la ronda siguiente; este documento conserva el diagnóstico original y el roadmap.
+**Estado:** los hallazgos P0/P1 principales se implementaron en las rondas siguientes. La Fase 3 añade instrumentación accesible mediante `window.gestureSynthPerformance()`; este documento conserva el diagnóstico y los objetivos de validación.
 
 ## Resumen ejecutivo
 
@@ -196,9 +196,7 @@ Cada `mouseenter` sintetiza de forma síncrona un segundo completo de audio (`48
 
 ## Inconsistencia que conviene corregir antes de benchmarkear
 
-`contract.md` y `CHANGELOG.md` describen seis pads e incluso un `Pluck`, pero el estado actual contiene cinco entradas en `public/pad-catalog.js`, cinco clases en `public/pad-registry.js` y no hay `pluck-pad.js`. Además, varios comentarios de `audio-engine.js` hablan de seis voces.
-
-No es por sí mismo un problema de FPS, pero puede invalidar benchmarks, tests y expectativas de memoria. Conviene decidir si el producto tiene cinco o seis pads y actualizar código/documentación antes de comparar resultados.
+La inconsistencia histórica de seis pads/`Pluck` fue corregida: la documentación y el código ahora declaran cinco pads, que son los que existen en `public/pad-catalog.js` y `public/pad-registry.js`.
 
 ---
 
@@ -210,9 +208,20 @@ No es por sí mismo un problema de FPS, pero puede invalidar benchmarks, tests y
 - El worker separa el cálculo de gestos del render de audio.
 - Los assets de MediaPipe se sirven localmente, lo que evita una dependencia de red de terceros durante la ejecución y ayuda a cumplir COEP.
 
-La principal deuda es que el protocolo todavía copia landmarks por mensajes y el AudioWorklet no cumple completamente la promesa de zero-allocation.
+La copia de landmarks y las asignaciones del AudioWorklet fueron eliminadas. La deuda restante es validar los números en navegador real y completar la prueba de memoria/cámara durante una sesión prolongada.
 
 ---
+
+## Estado de implementación
+
+- **Fase 1:** implementada — AudioWorklet sin arrays dinámicos, fast path de
+  silencio, cámara limitada, caché/compresión del servidor y lifecycle.
+- **Fase 2:** implementada — vídeo separado del canvas, landmarks sin objetos
+  temporales, slots SAB con secuencia y modo Lite/adaptativo.
+- **Fase 3:** instrumentada — `window.gestureSynthPerformance()` registra las
+  métricas solicitadas. Falta ejecutar la sesión de 60 segundos con cámara en
+  navegador y guardar el snapshot resultante.
+- **Preview:** se cachea un `AudioBuffer` por pad al primer uso.
 
 ## Roadmap recomendado
 
@@ -246,4 +255,4 @@ Criterios iniciales sugeridos: render estable a 30 FPS en modo normal, al menos 
 
 ## Veredicto
 
-Antes de optimizar la calidad visual o añadir más pads/efectos, atacaría **las asignaciones del AudioWorklet**, **la copia de landmarks**, **la composición fullscreen del canvas** y **la entrega/caché de MediaPipe**. Son los puntos con mayor probabilidad de producir síntomas visibles: clicks de audio, gestos con retraso, FPS inestables y arranque lento. El resto debe priorizarse con mediciones reales para no sacrificar calidad por una mejora teórica.
+Las optimizaciones estructurales de Fases 1 y 2 ya están aplicadas. El siguiente paso es ejecutar la sesión de 60 segundos en navegador real, consultar `gestureSynthPerformance()` y comparar p95 de inferencia/render, latencia de audio, frames saltados y memoria contra los criterios iniciales. Solo después conviene ajustar calidad visual o modelo Lite/Full.

@@ -44,11 +44,12 @@ function freqToNoteName(freq) {
 const EFFECT_NAMES = ['Reverb', 'Vibrato', 'Bitcrusher', 'Filter', 'Delay', 'Tremolo'];
 
 export class GraphicEngine {
-  constructor(canvas, sab, videoElement) {
+  constructor(canvas, sab, videoElement, performanceMonitor = null) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
     this.sab = sab;
     this.video = videoElement;
+    this.performanceMonitor = performanceMonitor;
 
     this.int32View = new Int32Array(sab);
     this.float32View = new Float32Array(sab);
@@ -111,8 +112,11 @@ export class GraphicEngine {
         this.fps = Math.round((this.frameCount * 1000) / (now - this.fpsTimer));
         this.frameCount = 0;
         this.fpsTimer = now;
+        this.performanceMonitor?.setRenderFps(this.fps);
       }
+      const renderStartedAt = performance.now();
       this.render();
+      this.performanceMonitor?.recordRender(performance.now() - renderStartedAt);
     }
     this.renderFrameId = requestAnimationFrame(this._boundRenderLoop);
   }

@@ -25,6 +25,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     }
 
     this.sampleRate = globalThis.sampleRate || 48000;
+    this.processCount = 0;
 
     // Envelope (steps are calculated from the active voice below)
     this.envelope = 0.0;
@@ -157,7 +158,19 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     for (let k = 0; k < 25; k++) this.float32View[167 + k] = 0.0;
   }
 
+  recordAudioCallback(startedAt, quantumSize) {
+    if (!startedAt || !this.float32View || !globalThis.performance) return;
+    const elapsed = globalThis.performance.now() - startedAt;
+    this.float32View[INDEXES.PERF_AUDIO_CALLBACK_MS] = elapsed;
+    this.float32View[INDEXES.PERF_AUDIO_CALLBACK_BUDGET_MS] =
+      (quantumSize / this.sampleRate) * 1000;
+    Atomics.add(this.int32View, INDEXES.PERF_AUDIO_CALLBACK_COUNT, 1);
+  }
+
   process(inputs, outputs) {
+    this.processCount++;
+    const shouldMeasure = (this.processCount & 31) === 0 && globalThis.performance;
+    const startedAt = shouldMeasure ? globalThis.performance.now() : 0;
     const output = outputs[0];
     if (!output?.[0]) return true;
     const out = output[0];
@@ -166,6 +179,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     if (!this.int32View || !this.float32View || N > MAX_RENDER_QUANTUM) {
       out.fill(0);
       if (output[1]) output[1].fill(0);
+      this.recordAudioCallback(startedAt, N);
       return true;
     }
 
@@ -257,6 +271,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       out.fill(0);
       if (output[1]) output[1].fill(0);
       this.writeSilentState(volume, mix, param);
+      this.recordAudioCallback(startedAt, N);
       return true;
     }
 
@@ -386,6 +401,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       this.float32View[oscOff + k] = this.wetBuf[Math.min(k * step, N - 1)];
     }
 
+    this.recordAudioCallback(startedAt, N);
     return true;
   }
 

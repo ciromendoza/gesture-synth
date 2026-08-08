@@ -101,13 +101,17 @@ async function testTrackingWorker() {
 }
 
 async function testStaticInvariants() {
-  const [audio, main, server] = await Promise.all([
+  const [audio, main, monitor, server] = await Promise.all([
     readFile(new URL('public/audio-engine.js', root), 'utf8'),
     readFile(new URL('public/main.js', root), 'utf8'),
+    readFile(new URL('public/performance-monitor.js', root), 'utf8'),
     readFile(new URL('server.js', root), 'utf8')
   ]);
   assert.doesNotMatch(audio, /const\s+freqs\s*=\s*\[/, 'audio process must not allocate per sample');
   assert.match(main, /TRACKING_INPUT/);
+  assert.match(main, /gestureSynthPerformance/);
+  assert.match(monitor, /p95/);
+  assert.match(monitor, /longtask/);
   assert.match(server, /createReadStream/);
   assert.match(server, /ETag/);
   assert.doesNotMatch(server, /readFileSync|existsSync|statSync/);

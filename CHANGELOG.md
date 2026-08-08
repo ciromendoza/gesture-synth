@@ -227,3 +227,18 @@ Sin bugs de código: cierre de verificación + deuda técnica.
   checklist y smoke test actualizados.
 - La rotación usa histéresis de salida (`0.25 rad`) para evitar parpadeos al
   cruzar el umbral de activación (`0.35 rad`).
+
+## Ronda 11 — Instrumentación de performance (2026-08-08)
+
+- Nuevo `public/performance-monitor.js` con ring buffers de inferencia y
+  render para calcular p50/p95/p99 sin asignaciones en los hot paths.
+- `window.gestureSynthPerformance()` expone FPS de render/cámara, frames
+  duplicados/saltados, errores de inferencia, Long Tasks, GC disponible,
+  latencias del AudioContext y duración muestreada del callback de audio.
+- MediaPipe registra la duración real de `hands.send()` y
+  `requestVideoFrameCallback`/fallback registra frames vistos, procesados,
+  duplicados y saltados.
+- GraphicEngine registra duración de render y AudioWorklet publica duración y
+  presupuesto del quantum en índices SAB 466–468.
+- `npm test` valida la presencia de los diagnósticos y las invariantes de
+  performance.

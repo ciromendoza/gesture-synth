@@ -110,7 +110,7 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | Mano derecha | 32–95 | detección, dedos, rotación, wrist, 42 floats de landmarks |
 | Mano izquierda | 96–159 | detección, pinch normalizado, rotación, wrist, 42 floats de landmarks |
 | Audio state | 160–191 | volumen, frecuencia, acorde activo, osciloscopio (25 floats) |
-| Reservado | 192–511 | 192–197: séptimas; 198–458: 3 slots de landmarks; 459–464: roles; 465: seventh active; resto libre |
+| Reservado | 192–511 | 192–197: séptimas; 198–458: 3 slots de landmarks; 459–464: roles; 465: seventh active; 466–468: métricas de audio; resto libre |
 
 ### 4.2 Índices exactos (fuente de verdad: `public/constants.js` → `INDEXES`)
 
@@ -134,7 +134,9 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | 192–197 | float32 | frecuencia de séptima para cada acorde |
 
 **Reservado / estado extendido:** `459–464` contiene el role index por acorde;
-`465` contiene `seventh active` (0/1), escrito por AudioWorklet.
+`465` contiene `seventh active` (0/1), escrito por AudioWorklet; `466–468`
+contienen duración muestreada del callback, duración teórica del quantum y
+contador de muestras de audio.
 
 **Entrada de tracking (escrita por main.js, leída por tracking-worker):**
 
@@ -320,6 +322,10 @@ const SCALES = {
 - La cámara está limitada a 640×480 y 30 FPS. `?tracking=lite` fuerza el
   modelo Lite; dispositivos de bajo consumo lo seleccionan automáticamente.
 - `cleanup()` libera cámara, worker, audio, MediaPipe y listeners gráficos.
+- `window.gestureSynthPerformance()` expone un snapshot de diagnóstico con
+  FPS, frames duplicados/saltados, p50/p95/p99 de inferencia/render, Long
+  Tasks, GC disponible, latencias del AudioContext y duración del callback de
+  AudioWorklet.
 
 ### 8.2 `public/tracking-worker.js` — gestos
 - Classic worker. Lee la entrada de landmarks desde los slots del SAB y
@@ -387,7 +393,7 @@ const SCALES = {
 ### 8.4 `public/graphic-engine.js` — Canvas2D overlay
 - Render loop con `requestAnimationFrame`, limitado a 30 FPS efectivos para
   coincidir con el tracking. El callback está preasignado y `stop()` cancela
-  su id.
+  su id. Cada render registra su duración en `PerformanceMonitor`.
 - La cámara se muestra en un `<video>` espejado por el compositor; el canvas
   es transparente y no vuelve a copiar el frame de vídeo con `drawImage()`.
 - Contexto 2D creado con `{ alpha: true, desynchronized: true }` como hint de
@@ -553,6 +559,29 @@ const SCALES = {
   efectos con `mix` bajo y ruta rápida cuando no hay voz ni cola.
 - El tracking ya no clona arrays de landmarks: los datos viajan por tres
   slots del SAB y el worker descarta tokens obsoletos.
+
+### Diagnóstico de performance (Fase 3)
+
+Después de iniciar una sesión, abrir la consola del navegador y ejecutar:
+
+```js
+const metrics = gestureSynthPerformance();
+console.table(metrics);
+```
+
+El snapshot incluye `renderFps`, `cameraFps`, frames duplicados/saltados,
+`inferenceMs.p50/p95/p99`, `renderMs.p50/p95/p99`, Long Tasks, eventos GC si el
+navegador los expone, `baseLatency`/`outputLatency` y el tiempo muestreado del
+callback de AudioWorklet. Para una sesión nueva:
+
+```js
+gestureSynthPerformance.reset();
+```
+
+Se recomienda registrar una sesión de 60 segundos, en caché fría y caliente,
+y guardar el objeto JSON resultante. Los objetivos iniciales son render estable
+a 30 FPS, al menos 25 FPS efectivos de cámara, p95 de inferencia menor a 25 ms
+y cero asignaciones por bloque de audio en producción.
 
 ### Pendiente de prueba manual (requiere cámara)
 
