@@ -159,8 +159,9 @@ export class GraphicEngine {
   // ─── Oscilloscope: flat ellipses (equalizer dots), no connecting line ──
   drawOscilloscope(w, h) {
     const ctx = this.ctx;
-    // Strip width proportional to canvas (was a fixed 60px)
-    const stripW = Math.max(48, Math.min(96, w * 0.08));
+    // Wider horizontal ellipses make the vertical wave read as a broad
+    // waveform rather than a narrow column of dots.
+    const stripW = Math.max(120, Math.min(220, w * 0.14));
     const centerX = stripW / 2;
 
     // Top/bottom margin, same rhythm as the info panel's edge margin
@@ -174,10 +175,8 @@ export class GraphicEngine {
 
     ctx.save();
 
-    // Faint container for the strip
-    ctx.fillStyle = 'rgba(255,255,255,0.04)';
-    ctx.fillRect(0, 0, stripW, h);
-
+    // No translucent container: the broad wave floats directly over the
+    // camera/video layer.
     // Subtle center guide (respects the same margins)
     ctx.strokeStyle = 'rgba(255,255,255,0.12)';
     ctx.lineWidth = 0.5;
@@ -186,15 +185,16 @@ export class GraphicEngine {
     ctx.lineTo(centerX, bottom);
     ctx.stroke();
 
-    const minR = 2, maxR = 10;
+    const minR = 2, maxR = 12;
     for (let k = 0; k < 25; k++) {
       const s = this.float32View[oscOff + k] || 0;
       const amp = Math.min(1, Math.abs(s));
       const r = minR + amp * (maxR - minR);
       const y = top + k * spacing;
       ctx.beginPath();
-      // "Flat" dot: ellipse wider than tall, size follows the sample amplitude
-      ctx.ellipse(centerX, y, r * 1.4, r * 0.7, 0, 0, Math.PI * 2);
+      // Broad ellipse: width follows the sample amplitude much more strongly
+      // than height, while keeping the vertical rhythm of the wave.
+      ctx.ellipse(centerX, y, r * 4.0, r * 0.7, 0, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,255,255,${0.3 + amp * 0.6})`;
       ctx.fill();
     }
@@ -324,10 +324,10 @@ export class GraphicEngine {
     const panelY = margin;
 
     const titleH = 44;    // two title lines (pad + effect) without colliding with bar labels
-    const rowH = 24;
+    const barH = 28;      // 4× the original 7px height
+    const rowH = barH + 22;
     const valW = 52;      // value column
     const barMaxW = panelW - pad * 2 - valW - 8;
-    const barH = 7;
     const fpsH = 30;      // two lines: rendered fps + camera fps
 
     ctx.save();
@@ -375,7 +375,6 @@ export class GraphicEngine {
   drawBar(x, y, maxW, h, norm, label, valueText) {
     const ctx = this.ctx;
     const fillW = Math.max(2, norm * maxW);
-    const valW = 52;
 
     ctx.save();
     // Label above the bar

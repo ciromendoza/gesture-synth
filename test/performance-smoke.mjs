@@ -109,6 +109,8 @@ async function testStaticInvariants() {
   ]);
   assert.doesNotMatch(audio, /const\s+freqs\s*=\s*\[/, 'audio process must not allocate per sample');
   assert.match(main, /TRACKING_INPUT/);
+  assert.match(main, /CONFIG_OCTAVE_SHIFT/);
+  assert.match(main, /octaveShift/);
   assert.match(main, /gestureSynthPerformance/);
   assert.match(monitor, /p95/);
   assert.match(monitor, /longtask/);

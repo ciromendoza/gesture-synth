@@ -106,7 +106,7 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 
 | Zona | Índices int32/float32 | Contenido |
 |---|---|---|
-| Config | 0–31 | sampleRate, bufferSize, canvas, cámara, efecto, raíz, frecuencias de acordes |
+| Config | 0–31 | sampleRate, bufferSize, canvas, cámara, efecto, raíz, octava y frecuencias de acordes |
 | Mano derecha | 32–95 | detección, dedos, rotación, wrist, 42 floats de landmarks |
 | Mano izquierda | 96–159 | detección, pinch normalizado, rotación, wrist, 42 floats de landmarks |
 | Audio state | 160–191 | volumen, frecuencia, acorde activo, osciloscopio (25 floats) |
@@ -131,6 +131,7 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | 11–28 | float32 | 6 acordes × 3 frecuencias de triada |
 | 29 | int32 | rootNote (0–11, índice en NOTE_NAMES) |
 | 30 | int32 | selectedPad (0–4, posición en PAD_CLASSES / PAD_CATALOG) |
+| 31 | int32 | octaveShift (-1 anterior, 0 base, +1 siguiente) |
 | 192–197 | float32 | frecuencia de séptima para cada acorde |
 
 **Reservado / estado extendido:** `459–464` contiene el role index por acorde;
@@ -321,6 +322,9 @@ const SCALES = {
   worker recibe solo `{type:'frame', slot, sequence}`.
 - La cámara está limitada a 640×480 y 30 FPS. `?tracking=lite` fuerza el
   modelo Lite; dispositivos de bajo consumo lo seleccionan automáticamente.
+- La octava se selecciona antes de iniciar (`octaveShift = -1/0/+1`) y se
+  incorpora a `generateChordFrequencies()` antes de escribir el SAB; no se
+  agrega lógica paralela al AudioWorklet.
 - `cleanup()` libera cámara, worker, audio, MediaPipe y listeners gráficos.
 - `window.gestureSynthPerformance()` expone un snapshot de diagnóstico con
   FPS, frames duplicados/saltados, p50/p95/p99 de inferencia/render, Long
@@ -402,14 +406,17 @@ const SCALES = {
   `Float32Array(42)` reutilizable para no crear objetos por render.
 - El tag de acorde añade `7` cuando `AUDIO_SEVENTH_ACTIVE` está publicado y
   lee los roles desde 459–464 (las séptimas ocupan 192–197).
-- **Osciloscopio**: franja izquierda proporcional (`max(48, min(96, w*0.08))`);
-  cada una de las 25 muestras se dibuja como una elipse "chata".
+- **Osciloscopio**: franja izquierda amplia (`max(120, min(220, w*0.14))`),
+  sin contenedor translúcido; las 25 muestras se dibujan como elipses muy
+  anchas (`xRadius = r*4`) para que la onda se extienda horizontalmente.
 - **Círculo de pinch**: radio `pow(volume, 0.55) * maxR * 1.4` con
   `maxR = max(60, min(120, h*0.15))`.
 - **Tag de acorde**: tooltip anclado a la muñeca derecha cuadro a cuadro,
   con opacidad controlada por el envelope de la voz activa.
 - **Panel HUD top-right**: panel semitransparente con pad, efecto, volumen,
-  FX Amount, FPS de render y FPS de cámara.
+  FX Amount, FPS de render y FPS de cámara. Las barras de Volumen y FX Amount
+  tienen `28px` de alto (4× los `7px` originales) y filas con separación
+  suficiente para no solaparse.
 - `resize` usa un listener guardado y `destroy()` lo remueve para evitar
   fugas si se reinicia el pipeline.
 
@@ -424,8 +431,9 @@ const SCALES = {
   el runtime genera frecuencias por escala en main.js.
 
 ### 8.6 `public/index.html`
-- Pantalla de inicio: selector de nota raíz (12), escala (6), efecto (6),
-  **librería de pads (6, desde `PAD_CATALOG`)**,
+- Pantalla de inicio: selector de nota raíz (12), octava (anterior/base/
+  siguiente), escala (6), efecto (6), **librería de pads (5, desde
+  `PAD_CATALOG`)**,
   botón Iniciar, indicador de carga, mensaje de error.
 - `<canvas id="main-canvas">` + `<script type="module" src="/main.js">`.
 - Estilos: fondo oscuro, botones minimalistas, sin glow.

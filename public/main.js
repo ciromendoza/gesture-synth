@@ -76,6 +76,7 @@ function rolesForScale(scaleName) {
 // ─── User selections ─────────────────────────────────────────────────────────
 const userConfig = {
   rootNote: 0,       // index into NOTE_NAMES
+  octaveShift: 0,    // -1 anterior, 0 base, +1 siguiente
   scale: 'Mayor',
   effect: 0,
   pad: 0             // index into PAD_CATALOG / PAD_CLASSES
@@ -98,6 +99,10 @@ function buildButtonGroup(containerId, items, selectedIdx, onSelect) {
 }
 
 buildButtonGroup('root-grid', NOTE_NAMES, 0, (i) => { userConfig.rootNote = i; });
+buildButtonGroup('octave-grid', ['Anterior', 'Base', 'Siguiente'], 1, (i) => {
+  userConfig.octaveShift = i - 1;
+  updatePreviewFrequencies();
+});
 buildButtonGroup('scale-grid', Object.keys(SCALES), 0, (i, name) => { userConfig.scale = name; });
 buildButtonGroup('effect-grid', EFFECTS, 0, (i) => { userConfig.effect = i; });
 buildButtonGroup('pad-grid', PAD_CATALOG.map(p => p.name), 0, (i) => { userConfig.pad = i; });
@@ -106,9 +111,25 @@ buildButtonGroup('pad-grid', PAD_CATALOG.map(p => p.name), 0, (i) => { userConfi
 // Reusa las MISMAS clases que el worklet (pad-registry.js): renderiza ~1 s
 // de la tríada C4 en un AudioBuffer y lo reproduce. Sin drift entre lo que
 // se escucha en la intro y lo que suena al iniciar.
-const PREVIEW_FREQS = [261.63, 329.63, 392.00]; // C4 mayor — tríada de prueba
+const PREVIEW_BASE_FREQS = [261.63, 329.63, 392.00]; // C4 mayor
+const PREVIEW_FREQS = new Float32Array(3);
 let previewCtx = null, previewNode = null;
 const previewBuffers = [];
+
+function invalidatePadPreviewCache() {
+  if (previewNode) { try { previewNode.stop(); } catch (e) {} previewNode = null; }
+  previewBuffers.length = 0;
+}
+
+function updatePreviewFrequencies() {
+  const multiplier = Math.pow(2, userConfig.octaveShift);
+  for (let i = 0; i < PREVIEW_FREQS.length; i++) {
+    PREVIEW_FREQS[i] = PREVIEW_BASE_FREQS[i] * multiplier;
+  }
+  invalidatePadPreviewCache();
+}
+
+updatePreviewFrequencies();
 
 function playPadPreview(padIdx) {
   const Cls = PAD_CLASSES[padIdx];
@@ -155,14 +176,13 @@ document.querySelectorAll('#pad-grid .sel-btn').forEach((btn, i) => {
 });
 
 function stopPreview() {
-  if (previewNode) { try { previewNode.stop(); } catch (e) {} previewNode = null; }
-  previewBuffers.length = 0;
+  invalidatePadPreviewCache();
   if (previewCtx) { previewCtx.close().catch(() => {}); previewCtx = null; }
 }
 
 // ─── Chord frequency generation ──────────────────────────────────────────────
-function generateChordFrequencies(rootNoteIdx, scaleName) {
-  const rootFreq = NOTE_FREQS[rootNoteIdx];
+function generateChordFrequencies(rootNoteIdx, scaleName, octaveShift = 0) {
+  const rootFreq = NOTE_FREQS[rootNoteIdx] * Math.pow(2, octaveShift);
   const intervals = SCALES[scaleName];
   const chords = [];
 
@@ -276,11 +296,12 @@ function writeConfigToSAB(cameraSettings = {}) {
   int32View[9] = 500;           // minTrackingConf
   int32View[10] = userConfig.effect; // selectedEffect
   int32View[30] = userConfig.pad;    // selectedPad (0–4, posición en PAD_CLASSES)
+  int32View[INDEXES.CONFIG_OCTAVE_SHIFT] = userConfig.octaveShift;
 
   // Write 6 chord triads to SAB config zone (float32 index 11–28).
   // The fourth/seventh tone lives in reserved float32 indices 192–197 so the
   // hand state zones remain stable.
-  const chords = generateChordFrequencies(userConfig.rootNote, userConfig.scale);
+  const chords = generateChordFrequencies(userConfig.rootNote, userConfig.scale, userConfig.octaveShift);
   for (let c = 0; c < 6; c++) {
     for (let n = 0; n < 3; n++) {
       float32View[11 + c * 3 + n] = chords[c][n];

@@ -31,6 +31,7 @@ export const INDEXES = {
   CONFIG_CHORD_SEVENTHS: 192, // float32 × 6; reserved SAB area
   CONFIG_ROOT_NOTE: 29,  // after 6 chord triads (float32 11–28)
   CONFIG_SELECTED_PAD: 30, // 0–4, posición en PAD_CLASSES (ver pad-catalog.js)
+  CONFIG_OCTAVE_SHIFT: 31, // -1 anterior, 0 base, +1 siguiente
 
   RIGHT_HAND_DETECTED: 32,
   RIGHT_FINGER_COUNT: 33,

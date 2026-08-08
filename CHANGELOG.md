@@ -242,3 +242,17 @@ Sin bugs de código: cierre de verificación + deuda técnica.
   presupuesto del quantum en índices SAB 466–468.
 - `npm test` valida la presencia de los diagnósticos y las invariantes de
   performance.
+
+## Ronda 12 — Octavas y ajuste visual del HUD (2026-08-08)
+
+- **Octavas**: nuevo selector inicial `Anterior / Base / Siguiente`. El
+  desplazamiento `-1/0/+1` se guarda en `CONFIG_OCTAVE_SHIFT` (SAB índice 31)
+  y se aplica al generar las frecuencias, antes del pipeline de audio. El
+  preview de pads también invalida su caché y cambia de octava.
+- **Barras HUD**: Volumen y FX Amount pasan de 7px a 28px de alto; el alto de
+  fila se adapta para evitar solapamientos.
+- **Osciloscopio**: se elimina el contenedor translúcido, se amplía la franja y
+  las elipses horizontales usan un radio X cuatro veces mayor para extenderse
+  ampliamente sobre el vídeo.
+- **Documentación**: contrato y layout SAB actualizados con el selector de
+  octava y los cambios visuales.
