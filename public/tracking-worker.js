@@ -119,15 +119,17 @@ function processFrame(slot, sequence) {
     if (fingerStates.ring) count++;
     if (fingerStates.pinky) count++;
 
-    // Palm Rotation: angle from wrist(0) to middle MCP(9)
+    // Signed palm rotation: use display-space X because the video is mirrored
+    // for the player. Positive means a turn to the player's right (minor),
+    // negative means a turn to the player's left (seventh chord).
     const mcp9 = rightOffset + 9 * 2;
-    const dx = float32View[mcp9] - wristX;
-    const dy = -(float32View[mcp9 + 1] - wristY);
+    const displayDX = -(float32View[mcp9] - wristX);
+    const displayDY = -(float32View[mcp9 + 1] - wristY);
 
     // Write computed right-hand data. The detection flag is published only
     // after all coordinates are written, so readers never consume a half frame.
     float32View[33] = count;
-    float32View[34] = Math.abs(Math.atan2(dx, dy));
+    float32View[34] = Math.atan2(displayDX, displayDY);
     float32View[35] = wristX;
     float32View[36] = wristY;
     for (let i = 0; i < 42; i++) {

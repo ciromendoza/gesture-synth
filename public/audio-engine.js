@@ -1,6 +1,11 @@
 // Audio Engine — reads chords from SAB config zone, left hand pinch=volume, rotation=effect amount
 
 import { PAD_CLASSES } from './pad-registry.js';
+import {
+  INDEXES,
+  PALM_ROTATION_RELEASE_THRESHOLD,
+  PALM_ROTATION_THRESHOLD
+} from './constants.js';
 
 const DENORMAL = 1e-18; // prevent denormal floats
 const TWO_PI = 2 * Math.PI;
@@ -27,6 +32,10 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     this.fastReleaseStep = 1.0 / (0.008 * this.sampleRate); // 8 ms — hot-swap de pad
     this.currentChordIndex = -1;
     this.noteHeld = false;
+    this.majorMinorMix = 0.0;
+    this.seventhActive = false;
+    this.seventhMix = 0.0;
+    this.rotationGesture = 0; // -1 seventh, 0 major, +1 minor
 
     // Synth voices are instantiated once. The current project ships five
     // catalog entries; adding a voice only requires extending the registry.
@@ -39,7 +48,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     // Pre-allocated buffers. Nothing in process() creates arrays or objects.
     this.dryBuf = new Float32Array(MAX_RENDER_QUANTUM);
     this.wetBuf = new Float32Array(MAX_RENDER_QUANTUM);
-    this.renderFreqs = new Float32Array(3);
+    this.renderFreqs = new Float32Array(4);
 
     // Effect state
     this.delayBuf = new Float32Array(Math.ceil(this.sampleRate));
@@ -81,6 +90,19 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
   }
 
   clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+  updateRotationGesture(rotation) {
+    if (this.rotationGesture === 1) {
+      if (rotation < PALM_ROTATION_RELEASE_THRESHOLD) this.rotationGesture = 0;
+    } else if (this.rotationGesture === -1) {
+      if (rotation > -PALM_ROTATION_RELEASE_THRESHOLD) this.rotationGesture = 0;
+    } else if (rotation > PALM_ROTATION_THRESHOLD) {
+      this.rotationGesture = 1;
+    } else if (rotation < -PALM_ROTATION_THRESHOLD) {
+      this.rotationGesture = -1;
+    }
+    return this.rotationGesture;
+  }
 
   prepareEffectParams(param) {
     this.reverbDecay = 0.3 + param * 0.35;
@@ -131,6 +153,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     this.float32View[164] = mix;
     this.float32View[165] = param;
     this.float32View[166] = 0.0;
+    Atomics.store(this.int32View, INDEXES.AUDIO_SEVENTH_ACTIVE, 0);
     for (let k = 0; k < 25; k++) this.float32View[167 + k] = 0.0;
   }
 
@@ -167,9 +190,14 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       else if (rc >= 1 && rc <= 5) chordIndex = rc - 1; // 1–5 fingers → chords 0–4
     }
 
-    const majorMinorMix = rightPalmRot > 0.35 ? 1.0 : 0.0;
+    const rotationGesture = rightDetected === 1
+      ? this.updateRotationGesture(rightPalmRot)
+      : (this.rotationGesture = 0);
+    const requestedMinor = rotationGesture === 1;
+    const requestedSeventh = rotationGesture === -1;
 
-    // Smoothed effect params from rotation
+    // Smoothed effect params from the left hand rotation
+
     const rawMix = leftDetected ? this.clamp(leftPalmRot / Math.PI, 0, 1) : 0.0;
     const rawParam = leftDetected ? this.clamp(leftPalmRot / Math.PI, 0, 1) : 0.5;
     this.smoothMix += (rawMix - this.smoothMix) * this.SMOOTH;
@@ -195,6 +223,10 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     // ─── Envelope ──────────────────────────────────────────────────────
     this.noteHeld = chordIndex >= 0;
     if (chordIndex >= 0) {
+      // Positive display-space rotation keeps the existing minor gesture;
+      // negative rotation adds the seventh without changing the triad root.
+      this.majorMinorMix = requestedMinor ? 1.0 : 0.0;
+      this.seventhActive = requestedSeventh;
       if (this.envelopeState === 'OFF' || this.envelopeState === 'RELEASE') {
         this.voice.noteOn(); // retrigger específico de la voz (fases, ruido KS)
         this.envelopeState = 'ATTACK';
@@ -202,8 +234,16 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       this.currentChordIndex = chordIndex;
     } else if (this.envelopeState === 'ATTACK' || this.envelopeState === 'SUSTAIN') {
       this.envelopeState = 'RELEASE';
+    } else if (this.envelopeState === 'OFF' && this.envelope <= 0) {
+      this.majorMinorMix = 0.0;
+      this.seventhActive = false;
+      this.rotationGesture = 0;
     }
 
+    const majorMinorMix = this.majorMinorMix;
+    const targetSeventhMix = this.seventhActive ? 1.0 : 0.0;
+    this.seventhMix += (targetSeventhMix - this.seventhMix) * this.SMOOTH;
+    const toneCount = this.seventhActive || this.seventhMix > AUDIO_SILENCE_EPS ? 4 : 3;
     const voiceWasActive = chordIndex >= 0 || this.envelopeState !== 'OFF' || this.envelope > 0;
     const effectHasTail = selectedEffect === 0 || selectedEffect === 4;
 
@@ -220,22 +260,26 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    // Read the active triad once per block. The reusable typed array is passed
-    // to the voice for every sample instead of allocating [f0, f1, f2].
+    // Read the active chord once per block. The reusable typed array contains
+    // triad + seventh and is passed for every sample instead of allocating an
+    // array of frequencies.
     const currentChordIndex = this.currentChordIndex;
     const hasChord = currentChordIndex >= 0 && currentChordIndex < 6;
     let chord0 = 0;
     let chord1 = 0;
     let chord2 = 0;
+    let chordSeventh = 0;
     if (hasChord) {
       const chordBase = 11 + currentChordIndex * 3;
       chord0 = this.float32View[chordBase];
       chord1 = this.float32View[chordBase + 1];
       chord2 = this.float32View[chordBase + 2];
+      chordSeventh = this.float32View[INDEXES.CONFIG_CHORD_SEVENTHS + currentChordIndex];
       const minorThird = chord1 * MINOR_THIRD_RATIO;
       this.renderFreqs[0] = chord0;
       this.renderFreqs[1] = chord1 * (1 - majorMinorMix) + minorThird * majorMinorMix;
       this.renderFreqs[2] = chord2;
+      this.renderFreqs[3] = chordSeventh;
     }
 
     // ─── Dry generation ────────────────────────────────────────────────
@@ -254,6 +298,9 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
           } else {
             this.envelopeState = 'OFF';
             this.currentChordIndex = -1;
+            this.majorMinorMix = 0.0;
+            this.seventhActive = false;
+            this.rotationGesture = 0;
           }
         }
       } else if (this.envelopeState === 'RELEASE') {
@@ -262,12 +309,15 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
           this.envelope = 0.0;
           this.envelopeState = 'OFF';
           this.currentChordIndex = -1;
+          this.majorMinorMix = 0.0;
+          this.seventhActive = false;
+          this.rotationGesture = 0;
         }
       }
 
       let sample = DENORMAL;
       if (this.envelope > 0 && hasChord) {
-        sample = this.voice.renderSample(this.renderFreqs);
+        sample = this.voice.renderSample(this.renderFreqs, toneCount, this.seventhMix);
         sample *= this.envelope;
         sample *= volume;
       }
@@ -327,6 +377,7 @@ class AudioEngineProcessor extends AudioWorkletProcessor {
     this.float32View[164] = mix;
     this.float32View[165] = param;
     this.float32View[166] = this.envelope;
+    Atomics.store(this.int32View, INDEXES.AUDIO_SEVENTH_ACTIVE, this.seventhActive ? 1 : 0);
 
     // Oscilloscope
     const oscOff = 167;

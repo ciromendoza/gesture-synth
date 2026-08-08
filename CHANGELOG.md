@@ -208,3 +208,22 @@ Sin bugs de código: cierre de verificación + deuda técnica.
 - **Documentación**: el estado real del repositorio contiene 5 pads (Sine,
   Saw, Square, FM Bell y Wavetable); se corrigieron referencias antiguas a un
   sexto pad/Pluck que no existe en el código actual.
+
+## Ronda 10 — Giro izquierdo y acordes de séptima (2026-08-08)
+
+- **Nuevo gesto**: la rotación firmada de la mano derecha se calcula en
+  espacio de pantalla espejado. Giro a la derecha (`> +0.35 rad`) conserva el
+  modo menor; giro a la izquierda (`< -0.35 rad`) activa la séptima.
+- **SAB**: cada acorde conserva sus tres frecuencias en 11–28 y añade su
+  séptima en 192–197. Los roles se desplazan a 459–464 y el flag de calidad
+  activa se publica en 465.
+- **Voces**: `SynthVoice.renderSample(freqs, toneCount, seventhMix)` admite
+  triadas y acordes de cuatro notas sin asignaciones dentro del AudioWorklet.
+  Las cinco voces prealocan cuatro fases por tono y hacen crossfade de la
+  cuarta frecuencia durante el gesto de séptima.
+- **HUD**: el tag de acorde añade la extensión `7` y conserva la séptima
+  durante la cola de release.
+- **Documentación y tests**: contrato, layout SAB, mapeo gestual, escalas,
+  checklist y smoke test actualizados.
+- La rotación usa histéresis de salida (`0.25 rad`) para evitar parpadeos al
+  cruzar el umbral de activación (`0.35 rad`).

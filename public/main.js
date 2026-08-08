@@ -2,7 +2,7 @@
 import { GraphicEngine } from './graphic-engine.js';
 import { PAD_CATALOG } from './pad-catalog.js';
 import { PAD_CLASSES } from './pad-registry.js';
-import { ROLE_ENUM, SAB_TOTAL_SIZE, TRACKING_INPUT } from './constants.js';
+import { INDEXES, ROLE_ENUM, SAB_TOTAL_SIZE, TRACKING_INPUT } from './constants.js';
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 const startScreen = document.getElementById('start-screen');
@@ -36,16 +36,19 @@ const TRACKING_MODEL_COMPLEXITY = requestedTrackingQuality === 'full' ? 1 :
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const NOTE_FREQS = [261.63,277.18,293.66,311.13,329.63,349.23,369.99,392.00,415.30,440.00,466.16,493.88];
 
-// Scale definitions: 6 chords × semitone intervals from root
-// Chord 5 (index 5, fingerCount=0/fist) = ii for Mayor, ii° for Menor,
-// vi° for Dorian, vi for Mixolydian, I repeat for Pentatónica, i for Blues.
+// Scale definitions: 6 chords × four semitone intervals from root
+// (triad + seventh). Chord 5 (index 5, fingerCount=0/fist) = ii for Mayor,
+// ii° for Menor, vi° for Dorian, vi for Mixolydian, I repeat for Pentatónica,
+// i for Blues.
 const SCALES = {
-  'Mayor':       [[0,4,7],[5,9,12],[7,11,14],[9,12,16],[4,7,11],[2,5,9]],
-  'Menor':       [[0,3,7],[5,8,12],[7,10,14],[8,12,15],[3,7,10],[2,5,8]],
-  'Dorian':      [[0,3,7],[2,5,9],[3,7,10],[5,9,12],[7,10,14],[9,12,15]],
-  'Mixolydian':  [[0,4,7],[2,5,9],[4,7,11],[5,9,12],[7,10,14],[9,12,15]],
-  'Pentatónica': [[0,4,7],[5,9,12],[7,11,14],[9,12,16],[2,5,9],[0,4,7]],
-  'Blues':       [[0,3,6,7],[3,6,9,12],[5,8,11,14],[6,9,12,15],[7,10,13,16],[0,3,7]]
+  // Every chord now carries its diatonic seventh as the fourth interval.
+  // The first three intervals remain unchanged in triad mode.
+  'Mayor':       [[0,4,7,11],[5,9,12,16],[7,11,14,17],[9,12,16,19],[4,7,11,14],[2,5,9,12]],
+  'Menor':       [[0,3,7,10],[5,8,12,15],[7,10,14,17],[8,12,15,19],[3,7,10,14],[2,5,8,12]],
+  'Dorian':      [[0,3,7,10],[2,5,9,12],[3,7,10,14],[5,9,12,16],[7,10,14,17],[9,12,15,19]],
+  'Mixolydian':  [[0,4,7,10],[2,5,9,12],[4,7,11,14],[5,9,12,16],[7,10,14,17],[9,12,15,19]],
+  'Pentatónica': [[0,4,7,11],[5,9,12,16],[7,11,14,17],[9,12,16,19],[2,5,9,12],[0,4,7,11]],
+  'Blues':       [[0,3,6,10],[3,6,9,13],[5,8,11,15],[6,9,12,16],[7,10,13,17],[0,3,7,10]]
 };
 
 const EFFECTS = ['Reverb','Vibrato','Bitcrusher','Filter','Delay','Tremolo'];
@@ -159,7 +162,7 @@ function generateChordFrequencies(rootNoteIdx, scaleName) {
   for (let c = 0; c < 6; c++) {
     const chordIntervals = intervals[c] || [0, 4, 7];
     const notes = [];
-    for (let n = 0; n < 3; n++) {
+    for (let n = 0; n < 4; n++) {
       const semitones = chordIntervals[n] || 0;
       notes.push(rootFreq * Math.pow(2, semitones / 12));
     }
@@ -265,21 +268,23 @@ function writeConfigToSAB(cameraSettings = {}) {
   int32View[10] = userConfig.effect; // selectedEffect
   int32View[30] = userConfig.pad;    // selectedPad (0–4, posición en PAD_CLASSES)
 
-  // Write 6 chord frequencies to SAB config zone (float32 index 11–28)
-  // Root note moved to index 29 (after 6×3=18 floats)
+  // Write 6 chord triads to SAB config zone (float32 index 11–28).
+  // The fourth/seventh tone lives in reserved float32 indices 192–197 so the
+  // hand state zones remain stable.
   const chords = generateChordFrequencies(userConfig.rootNote, userConfig.scale);
   for (let c = 0; c < 6; c++) {
     for (let n = 0; n < 3; n++) {
       float32View[11 + c * 3 + n] = chords[c][n];
     }
+    float32View[INDEXES.CONFIG_CHORD_SEVENTHS + c] = chords[c][3];
   }
-  int32View[29] = userConfig.rootNote; // root note index (0–11)
+  int32View[INDEXES.CONFIG_ROOT_NOTE] = userConfig.rootNote; // root note index (0–11)
 
-  // Write scale degree roles to reserved zone (int32 192–197).
-  // Indices into ROLE_ENUM — derived from the same intervals as frequencies.
+  // Write scale degree roles to the tail of the reserved zone. The seventh
+  // frequencies occupy 192–197 and therefore cannot share those bytes.
   const roles = rolesForScale(userConfig.scale);
   for (let c = 0; c < 6; c++) {
-    int32View[192 + c] = ROLE_ENUM.indexOf(roles[c]);
+    int32View[INDEXES.RESERVED_CHORD_ROLES + c] = ROLE_ENUM.indexOf(roles[c]);
   }
 
   for (const slot of TRACKING_INPUT.SLOTS) {
@@ -292,7 +297,8 @@ function writeConfigToSAB(cameraSettings = {}) {
 
   Atomics.store(int32View, 32, 0);  // RIGHT_HAND_DETECTED
   Atomics.store(int32View, 96, 0);  // LEFT_HAND_DETECTED
-  int32View[162] = -1; // AUDIO_ACTIVE_CHORD_INDEX
+  int32View[INDEXES.AUDIO_ACTIVE_CHORD_INDEX] = -1;
+  Atomics.store(int32View, INDEXES.AUDIO_SEVENTH_ACTIVE, 0);
 }
 
 // ─── MediaPipe ───────────────────────────────────────────────────────────────
@@ -454,6 +460,7 @@ function resetGestureState() {
   if (!int32View) return;
   Atomics.store(int32View, 32, 0);
   Atomics.store(int32View, 96, 0);
+  Atomics.store(int32View, INDEXES.AUDIO_SEVENTH_ACTIVE, 0);
   int32View[33] = 0;
   int32View[97] = 0;
 }

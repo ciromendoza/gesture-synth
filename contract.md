@@ -110,7 +110,7 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | Mano derecha | 32–95 | detección, dedos, rotación, wrist, 42 floats de landmarks |
 | Mano izquierda | 96–159 | detección, pinch normalizado, rotación, wrist, 42 floats de landmarks |
 | Audio state | 160–191 | volumen, frecuencia, acorde activo, osciloscopio (25 floats) |
-| Reservado | 192–511 | 192–197: roles; 198–458: 3 slots de landmarks; resto libre |
+| Reservado | 192–511 | 192–197: séptimas; 198–458: 3 slots de landmarks; 459–464: roles; 465: seventh active; resto libre |
 
 ### 4.2 Índices exactos (fuente de verdad: `public/constants.js` → `INDEXES`)
 
@@ -128,9 +128,13 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | 8 | int32 | minDetectionConf (500 = 0.5×1000) |
 | 9 | int32 | minTrackingConf (500) |
 | 10 | int32 | selectedEffect (0–5) |
-| 11–28 | float32 | 6 acordes × 3 frecuencias (generadas por escala+tónica) |
+| 11–28 | float32 | 6 acordes × 3 frecuencias de triada |
 | 29 | int32 | rootNote (0–11, índice en NOTE_NAMES) |
 | 30 | int32 | selectedPad (0–4, posición en PAD_CLASSES / PAD_CATALOG) |
+| 192–197 | float32 | frecuencia de séptima para cada acorde |
+
+**Reservado / estado extendido:** `459–464` contiene el role index por acorde;
+`465` contiene `seventh active` (0/1), escrito por AudioWorklet.
 
 **Entrada de tracking (escrita por main.js, leída por tracking-worker):**
 
@@ -145,7 +149,7 @@ descarta tokens obsoletos o slots incompletos.
 |---|---|---|
 | 32 | int32 | handDetected (1/0) |
 | 33 | float32 | fingerCount (0–5, con histéresis; 0 = puño cerrado → acorde 5) |
-| 34 | float32 | palmRotation = abs(atan2(dx, dy)) desde muñeca→MCP medio (0–π) |
+| 34 | float32 | signed palmRotation en espacio espejado; derecha >0, izquierda <0 |
 | 35 | float32 | wrist.x |
 | 36 | float32 | wrist.y |
 | 37–78 | float32 | 21 landmarks × (x, y) |
@@ -171,6 +175,7 @@ descarta tokens obsoletos o slots incompletos.
 | 165 | float32 | effect param (0–1, suavizado) |
 | 166 | float32 | envelope (0–1) |
 | 167–191 | float32 | osciloscopio (25 muestras) |
+| 465 | int32 | seventh active (0/1) |
 
 > `constants.js` es la referencia de índices y offsets del SAB. Los índices
 > nuevos de entrada de tracking se exportan como `TRACKING_INPUT`; no
@@ -213,9 +218,18 @@ descarta tokens obsoletos o slots incompletos.
 - Pulgar: distancia(tip(4), MCP meñique(17)) vs distancia(IP(3), MCP meñique(17)).
   Si tip está más lejos, el pulgar está extendido — invariante a orientación/rotación.
   Otros dedos: `tip.y < pip.y`.
-- **Rotación de palma** (índice 34): `abs(atan2(dx, dy))` con
-  `dx = mcp9.x - wrist.x`, `dy = -(mcp9.y - wrist.y)`.
-  Sirve como **switch binario mayor/menor**: `> 0.35 rad → menor`, si no mayor.
+- **Rotación de palma** (índice 34): ángulo firmado en espacio de pantalla
+  espejado: `atan2(displayDX, displayDY)`, con `displayDX = -(mcp9.x - wrist.x)`
+  y `displayDY = -(mcp9.y - wrist.y)`.
+- Umbral `PALM_ROTATION_THRESHOLD = 0.35 rad` con retorno/histéresis en
+  `PALM_ROTATION_RELEASE_THRESHOLD = 0.25 rad`:
+  - `rotation > +0.35` → conserva la **menor**.
+  - `rotation < -0.35` → activa la **séptima** del acorde.
+  - entre ambos → triada mayor normal, salvo que el gesto anterior siga dentro
+    de su banda de histéresis.
+- La séptima se escribe como el cuarto intervalo de cada entrada de `SCALES`
+  y se mezcla solo cuando el gesto izquierdo está activo; no se altera la raíz
+  ni el mapeo 0–5 dedos → acorde.
 
 ### 6.2 Mano izquierda → volumen y efecto
 
@@ -248,6 +262,9 @@ float32View[98] = clamp01(pitchAngle / (Math.PI / 4)) * Math.PI;
 
 - **Sin mano izquierda**: volumen forzado a 0.7, mix a 0.0, param a 0.5.
 - **Sin mano derecha**: silencio (chordIndex = -1).
+- **Giro derecho** de la palma: tercera menor, como en la versión anterior.
+- **Giro izquierdo** de la palma: cuarta frecuencia de la escala activa (la
+  séptima), manteniendo la raíz y el acorde seleccionados por los dedos.
 - Envolvente ADSR simple: attack 80ms / release 150ms (constantes en
   `constants.js`, importadas por el worklet — fuente única, ver sección 8.3).
 
@@ -259,18 +276,19 @@ Definidas en `main.js` como **6 acordes × intervalos de semitonos desde la raí
 
 ```js
 const SCALES = {
-  'Mayor':       [[0,4,7],[5,9,12],[7,11,14],[9,12,16],[4,7,11],[2,5,9]],
-  'Menor':       [[0,3,7],[5,8,12],[7,10,14],[8,12,15],[3,7,10],[2,5,8]],
-  'Dorian':      [[0,3,7],[2,5,9],[3,7,10],[5,9,12],[7,10,14],[9,12,15]],
-  'Mixolydian':  [[0,4,7],[2,5,9],[4,7,11],[5,9,12],[7,10,14],[9,12,15]],
-  'Pentatónica': [[0,4,7],[5,9,12],[7,11,14],[9,12,16],[2,5,9],[0,4,7]],
-  'Blues':       [[0,3,6,7],[3,6,9,12],[5,8,11,14],[6,9,12,15],[7,10,13,16],[0,3,7]]
+  'Mayor':       [[0,4,7,11],[5,9,12,16],[7,11,14,17],[9,12,16,19],[4,7,11,14],[2,5,9,12]],
+  'Menor':       [[0,3,7,10],[5,8,12,15],[7,10,14,17],[8,12,15,19],[3,7,10,14],[2,5,8,12]],
+  'Dorian':      [[0,3,7,10],[2,5,9,12],[3,7,10,14],[5,9,12,16],[7,10,14,17],[9,12,15,19]],
+  'Mixolydian':  [[0,4,7,10],[2,5,9,12],[4,7,11,14],[5,9,12,16],[7,10,14,17],[9,12,15,19]],
+  'Pentatónica': [[0,4,7,11],[5,9,12,16],[7,11,14,17],[9,12,16,19],[2,5,9,12],[0,4,7,11]],
+  'Blues':       [[0,3,6,10],[3,6,9,13],[5,8,11,15],[6,9,12,16],[7,10,13,17],[0,3,7,10]]
 };
 ```
 
 - `generateChordFrequencies(rootIdx, scale)` → `rootFreq * 2^(semitone/12)`.
-- Solo se usan los primeros 3 intervalos de cada acorde (triada).
-- Se escriben en SAB índices float32 11–28 (6×3).
+- Los primeros 3 intervalos son la triada y el cuarto es la séptima.
+- Las triadas se escriben en SAB índices float32 11–28 (6×3); las séptimas
+  en 192–197.
 - **6º acorde (índice 5)**: activado por puño cerrado (fingerCount=0).
   - Mayor: ii (Dm, [2,5,9]) — el grado diatónico ii que faltaba.
   - Menor: ii° (Ddim, [2,5,8]) — el grado ii° natural de la escala menor.
@@ -311,6 +329,8 @@ const SCALES = {
 - Pulgar: detección por distancias (tip→pinkyMCP vs IP→pinkyMCP), no por eje x.
 - Pinch: normalizado por palmLen a 0–1 con rango [PINCH_MIN_NORM=0.15, PINCH_MAX_NORM=0.80].
 - Pitch: ángulo del vector wrist→MCP(9) respecto a vertical, limitado a 45°.
+- Rotación derecha/izquierda: escribe un ángulo firmado en el índice 34,
+  invirtiendo X para coincidir con el vídeo espejado.
 - fingerCount=0 (puño cerrado) → audio-engine mapea a chordIndex=5 (6º acorde).
 - No importa nada (clamp01 y applyHysteresis son funciones locales).
 
@@ -325,9 +345,11 @@ const SCALES = {
   constructor: `this.voices = PAD_CLASSES.map(Cls => new Cls(sampleRate))`
   (`PAD_CLASSES` importado de `pad-registry.js` — módulo compartido con el
   main thread). En `process()` NO hay switch por pad — solo
-  `voice.renderSample(renderFreqs)` con un `Float32Array` reutilizable.
+  `voice.renderSample(renderFreqs, toneCount)` con un `Float32Array` reutilizable.
 - Tercer grado ajustable mayor↔menor ANTES de renderizar:
-  `third = chord[1] * 2^(-1/12)` si menor; las 3 frecuencias se pasan a la voz.
+  `third = chord[1] * 2^(-1/12)` si menor. En modo séptima se pasa además
+  la cuarta frecuencia escrita en SAB 192–197; la interfaz de voz recibe un
+  `Float32Array(4)` reutilizable y un `toneCount` de 3 o 4.
 - Envolvente por voz: cada `SynthVoice` expone `attackTime`/`releaseTime`
   (defaults importados de `constants.js` — fuente única desde la ronda de
   limpieza). Los pasos se recalculan al cambiar de pad.
@@ -341,6 +363,12 @@ const SCALES = {
   recarga de ruido de Karplus-Strong).
 - Parámetros suavizados con EMA (coef 0.12) para evitar clics.
 - **6 acordes** (índices 0–5); fingerCount=0 → chordIndex=5 (puño).
+- Rotación derecha `> +0.35` conserva `majorMinorMix=1`; rotación izquierda
+  `< -0.35` usa `toneCount=4` y publica `AUDIO_SEVENTH_ACTIVE=1`. La cuarta
+  voz entra/sale con `seventhMix` suavizado. Ambos estados tienen retorno a
+  0.25 rad para evitar parpadeo en el umbral.
+- Durante el release se conserva la calidad activa hasta que la envolvente
+  llega a cero, evitando que la séptima desaparezca a mitad de la cola.
 - Efectos (switch por `selectedEffect`): 0 Reverb (tap multi-deley,
   decay 0.30–0.65), 1 Vibrato/Chorus (depth 2–8%, LFO con **acumulador de
   fase persistente**), 2 Bitcrusher (3–12 bits), 3 Filter (LP 1-polo con
@@ -366,6 +394,8 @@ const SCALES = {
   baja latencia (el navegador puede ignorar la segunda opción).
 - Landmarks: `x = (1.0 - sabX) * w` (inversión X por espejo), usando un
   `Float32Array(42)` reutilizable para no crear objetos por render.
+- El tag de acorde añade `7` cuando `AUDIO_SEVENTH_ACTIVE` está publicado y
+  lee los roles desde 459–464 (las séptimas ocupan 192–197).
 - **Osciloscopio**: franja izquierda proporcional (`max(48, min(96, w*0.08))`);
   cada una de las 25 muestras se dibuja como una elipse "chata".
 - **Círculo de pinch**: radio `pow(volume, 0.55) * maxR * 1.4` con
@@ -408,7 +438,9 @@ const SCALES = {
 
 ### 8.8 `public/synths/` — librería de 5 pads + `pad-catalog.js`
 - **`synth-voice.js`**: interfaz común `SynthVoice` (`constructor(sampleRate)`,
-  `renderSample(freqs)` → muestra en [-1,1], `noteOn()`). Expone además
+  `renderSample(freqs, toneCount, seventhMix)` → muestra en [-1,1], `noteOn()`).
+  `freqs` tiene cuatro tonos, `toneCount` selecciona triada o séptima y
+  `seventhMix` suaviza la entrada/salida de la cuarta voz. Expone además
   `attackTime`/`releaseTime` (defaults de `constants.js`) para la envolvente
   por voz. audio-engine maneja compartidos: envolvente, volumen, mix dry/wet
   y soft-clip — NO se duplican por synth.
@@ -416,13 +448,14 @@ const SCALES = {
   RESTA de la onda naive (anti-aliasing de sierra y pulso).
 - Los 5 pads actuales (registry `PAD_CLASSES`; **el orden es sagrado**, ver
   gotcha sección 10):
-  1. **Sine Pad** (`sine-pad.js`) — 3 osciladores seno.
+  1. **Sine Pad** (`sine-pad.js`) — hasta 4 osciladores seno.
   2. **Saw Pad** (`saw-pad.js`) — sierra PolyBLEP (`2t-1 - polyBLEP`).
   3. **Square Pad** (`square-pad.js`) — pulso duty 50% con BLEP.
-  4. **FM Bell** (`fm-bell-pad.js`) — FM de 2 operadores, ratio 2.4 e índice
-     3.5, con parciales inarmónicos de campana.
+  4. **FM Bell** (`fm-bell-pad.js`) — FM de 2 operadores por tono, ratio 2.4
+     e índice 3.5, con parciales inarmónicos de campana.
   5. **Wavetable** (`wavetable-pad.js`) — tabla de 2048 samples con armónicos
-     1..8, pre-calculada en el constructor y leída con interpolación lineal.
+     1..8, pre-calculada en el constructor y leída con interpolación lineal;
+     procesa la cuarta lectura solo en modo séptima.
 - **`pad-registry.js`**: registro compartido `PAD_CLASSES` (las 5 clases, sin
   APIs de browser) — lo importa audio-engine.js para instanciar las voces y
   main.js para el preview de la intro.
@@ -467,6 +500,9 @@ const SCALES = {
     frecuencias y coeficientes se preparan fuera del loop de muestras.
 14. La página oculta suspende audio, vídeo, tracking y gráficos; `destroy()`
     remueve listeners para que reiniciar no acumule recursos.
+15. La rotación derecha/izquierda usa un único ángulo firmado: derecha conserva
+    la menor y izquierda activa la séptima. No se agregan gestos paralelos ni
+    se cambia el mapeo de dedos/acordes.
 
 ---
 
@@ -497,6 +533,9 @@ const SCALES = {
   del SAB.
 - **`selectedPad` comparte bytes con `float32View[30]`** (vistas int32/float32
   del mismo SAB): escribir el pad como int32 y nunca leerlo como float.
+- Las frecuencias de séptima ocupan `float32View[192..197]`; no volver a usar
+  esa zona para roles. Los roles están en `int32View[459..464]` y el flag HUD
+  en `int32View[465]`.
 
 ---
 
@@ -520,7 +559,9 @@ const SCALES = {
 Checklist final, con todos los fixes de rondas anteriores ya aplicados:
 
 - [ ] 0–5 dedos → 6 acordes (incluye puño cerrado → acorde 5).
-- [ ] Mayor/menor con rotación de palma derecha (umbral 0.35 rad).
+- [ ] Mayor/menor con giro derecho de palma (índice 34 > +0.35 rad).
+- [ ] Séptima con giro izquierdo de palma (índice 34 < -0.35 rad), incluida
+      la transición y el release sin clicks; el HUD debe mostrar `7`.
 - [ ] Volumen con pinch izquierdo en ≥2 distancias a la cámara
       (confirma la normalización por palmLen).
 - [ ] Efecto (mix + param) con inclinación de muñeca izquierda.

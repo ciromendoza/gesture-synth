@@ -28,7 +28,8 @@ export const INDEXES = {
   CONFIG_MODEL_COMPLEXITY: 7,
   CONFIG_MIN_DETECTION_CONF: 8,
   CONFIG_SELECTED_EFFECT: 10,
-  CONFIG_ROOT_NOTE: 29,  // after 6 chord frequencies (float32 11–28)
+  CONFIG_CHORD_SEVENTHS: 192, // float32 × 6; reserved SAB area
+  CONFIG_ROOT_NOTE: 29,  // after 6 chord triads (float32 11–28)
   CONFIG_SELECTED_PAD: 30, // 0–4, posición en PAD_CLASSES (ver pad-catalog.js)
 
   RIGHT_HAND_DETECTED: 32,
@@ -53,17 +54,20 @@ export const INDEXES = {
   AUDIO_VIBRATO_DEPTH: 165,
   AUDIO_ENVELOPE_STATE: 166,
   AUDIO_OSCILLOSCOPE_BUFFER: 167,
+  AUDIO_SEVENTH_ACTIVE: 465, // int32; written by AudioWorklet for HUD/tag
 
-  RESERVED_CHORD_ROLES: 192  // int32 × 6 (192–197): role index for each chord
+  RESERVED_CHORD_ROLES: 459  // int32 × 6 (459–464): role index for each chord
 };
 
 // Fixed vocabulary of scale degree names — generic, not scale-dependent.
 // Roles are DERIVED from SCALES in main.js (DEGREE_NAMES map) and written
-// to SAB zone 192–197 as indices into this enum.
+// to SAB zone 459–464 as indices into this enum; 192–197 stores seventh Hz.
 export const ROLE_ENUM = ['Tónica','Segunda','Tercera','Cuarta','Quinta','Sexta'];
 
 // Gestural thresholds & audio constants
 export const HYSTERESIS_THRESHOLD = 0.02;
+export const PALM_ROTATION_THRESHOLD = 0.35;
+export const PALM_ROTATION_RELEASE_THRESHOLD = 0.25;
 export const PINCH_OPEN_THRESHOLD = 0.15;
 export const PINCH_CLOSE_THRESHOLD = 0.03;
 

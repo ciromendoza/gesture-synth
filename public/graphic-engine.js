@@ -1,6 +1,7 @@
 import {
-  ROLE_ENUM,
-  HAND_CONNECTIONS
+  HAND_CONNECTIONS,
+  INDEXES,
+  ROLE_ENUM
 } from './constants.js';
 import { PAD_CATALOG } from './pad-catalog.js';
 
@@ -426,15 +427,17 @@ export class GraphicEngine {
     const wristX = (1.0 - this.float32View[35]) * w;
     const wristY = this.float32View[36] * h;
 
-    // Role derived from SCALES intervals (written to SAB zone 192–197 by main.js)
-    const roleIdx = this.int32View[192 + chordIdx];
+    // Role derived from SCALES intervals (written to SAB zone 459–464 by main.js)
+    const roleIdx = this.int32View[INDEXES.RESERVED_CHORD_ROLES + chordIdx];
     const role = (roleIdx >= 0 && roleIdx < ROLE_ENUM.length) ? ROLE_ENUM[roleIdx] : '?';
 
     const isMinor = this.float32View[163] >= 0.5;
+    const seventhActive = Atomics.load(this.int32View, INDEXES.AUDIO_SEVENTH_ACTIVE) === 1;
     const mode = isMinor ? 'min' : 'maj';
+    const extension = seventhActive ? ' 7' : '';
     const soundingFreq = this.float32View[161];
     const name = freqToNoteName(soundingFreq) || NOTE_NAMES[0];
-    const mainLabel = `${name} ${mode}`;
+    const mainLabel = `${name} ${mode}${extension}`;
 
     ctx.save();
     ctx.globalAlpha = Math.min(1, envelope); // fade with the audio release

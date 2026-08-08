@@ -1,7 +1,4 @@
-// Wavetable Pad — tabla de onda fija pre-calculada EN EL CONSTRUCTOR
-// (prohibido asignar memoria en process()). Suma de armónicos 1..8 con
-// amplitud 1/h normalizada: timbre denso tipo "supersaw suave". Lectura con
-// interpolación lineal entre samples adyacentes de la tabla.
+// Wavetable Pad — tabla fija pre-calculada en el constructor.
 import { SynthVoice } from './synth-voice.js';
 
 const TWO_PI = 2 * Math.PI;
@@ -20,16 +17,18 @@ export class WavetablePad extends SynthVoice {
       for (let h = 1; h <= HARMONICS; h++) s += Math.sin(p * h) / h;
       this.table[i] = s / norm;
     }
-    this.phases = [0, 0, 0]; // en unidades de tabla [0, TABLE_SIZE)
+    this.phases = [0, 0, 0, 0]; // en unidades de tabla [0, TABLE_SIZE)
   }
 
   noteOn() {
     this.phases[0] = 0;
     this.phases[1] = 0;
     this.phases[2] = 0;
+    this.phases[3] = 0;
   }
 
-  renderSample(freqs) {
+  renderSample(freqs, toneCount = 3, seventhMix = 0) {
+    const extension = toneCount === 4 ? (seventhMix > 0 ? seventhMix : 1) : seventhMix;
     let sample = 0;
     for (let n = 0; n < 3; n++) {
       this.phases[n] += (freqs[n] / this.sampleRate) * TABLE_SIZE;
@@ -39,6 +38,14 @@ export class WavetablePad extends SynthVoice {
       const i1 = (i0 + 1) % TABLE_SIZE;
       sample += this.table[i0] * (1 - frac) + this.table[i1] * frac;
     }
-    return sample / 3;
+    if (extension > 0) {
+      this.phases[3] += (freqs[3] / this.sampleRate) * TABLE_SIZE;
+      if (this.phases[3] >= TABLE_SIZE) this.phases[3] -= TABLE_SIZE;
+      const i0 = Math.floor(this.phases[3]);
+      const frac = this.phases[3] - i0;
+      const i1 = (i0 + 1) % TABLE_SIZE;
+      sample += (this.table[i0] * (1 - frac) + this.table[i1] * frac) * extension;
+    }
+    return sample / (3 + extension);
   }
 }
