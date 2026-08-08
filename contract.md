@@ -17,7 +17,7 @@ completamente cliente-servidor sin bundlers ni frameworks.
 - **Comunicación entre hilos**: un único `SharedArrayBuffer` de 2048 bytes
   compartido entre el worker de tracking, el AudioWorklet y el main thread.
 - **Audio**: AudioWorkletProcessor (`audio-engine.js`) genera síntesis por
-  **6 pads seleccionables** (librería de la intro, interfaz `SynthVoice`
+  **5 pads seleccionables** (librería de la intro, interfaz `SynthVoice`
   común) + 6 efectos DSP compartidos.
 - **Visualización**: Canvas2D espejado de la cámara, landmarks blancos,
   osciloscopio vertical a la izquierda, círculo de pinch, barras de datos.
@@ -127,7 +127,7 @@ bytes. Nunca uses el mismo índice con dos tipos distintos a la vez.
 | 10 | int32 | selectedEffect (0–5) |
 | 11–28 | float32 | 6 acordes × 3 frecuencias (generadas por escala+tónica) |
 | 29 | int32 | rootNote (0–11, índice en NOTE_NAMES) |
-| 30 | int32 | selectedPad (0–5, posición en PAD_CLASSES / PAD_CATALOG) |
+| 30 | int32 | selectedPad (0–4, posición en PAD_CLASSES / PAD_CATALOG) |
 
 **Mano derecha (escrito por tracking-worker):**
 | Índice | Tipo | Campo |
@@ -303,7 +303,7 @@ const SCALES = {
   pre-allocan en el constructor (`dryBuf`, `wetBuf`, `delayBuf`, `reverbBuf`).
 - Guardas anti-denormal (`DENORMAL = 1e-18`) en feedback de filter y delay.
 - Sintetiza los acordes con la **voz activa** (`this.voice`), seleccionada por
-  `selectedPad` (SAB índice 30) entre 6 voces instanciadas UNA vez en el
+  `selectedPad` (SAB índice 30) entre 5 voces instanciadas UNA vez en el
   constructor: `this.voices = PAD_CLASSES.map(Cls => new Cls(sampleRate))`
   (`PAD_CLASSES` importado de `pad-registry.js` — módulo compartido con el
   main thread). En `process()` NO hay switch por pad — solo
@@ -312,8 +312,8 @@ const SCALES = {
   `third = chord[1] * 2^(-1/12)` si menor; las 3 frecuencias se pasan a la voz.
 - Envolvente por voz: cada `SynthVoice` expone `attackTime`/`releaseTime`
   (defaults importados de `constants.js` — fuente única desde la ronda de
-  limpieza). Pluck acorta `attackTime` a 2 ms (percusivo, su propia síntesis
-  ya decae). Los pasos se recalculan al cambiar de pad.
+  limpieza). Los 5 pads actuales usan el default global. Los pasos se
+  recalculan al cambiar de pad.
 - **Hot-swap de pad sin click** (sección 9, decisión 12): al detectar cambio
   de `selectedPad` con nota sostenida, estado `QUICK_RELEASE` (release de
   8 ms) seguido de re-trigger (`noteOn()` + ATTACK con el attack de la voz
@@ -393,7 +393,7 @@ const SCALES = {
 
 ### 8.6 `public/index.html`
 - Pantalla de inicio: selector de nota raíz (12), escala (6), efecto (6),
-  **librería de pads (6, desde `PAD_CATALOG`)**,
+  **librería de pads (5, desde `PAD_CATALOG`)**,
   botón Iniciar, indicador de carga, mensaje de error.
 - `<canvas id="main-canvas">` + `<script type="module" src="/main.js">`.
 - Estilos: fondo oscuro, botones minimalistas, sin glow.
@@ -404,7 +404,7 @@ const SCALES = {
   `.tflite`/`.data`/`.bin` → `application/octet-stream`. Crítico para el
   AudioWorklet y la carga de MediaPipe.
 
-### 8.8 `public/synths/` — librería de 6 pads + `pad-catalog.js`
+### 8.8 `public/synths/` — librería de 5 pads + `pad-catalog.js`
 - **`synth-voice.js`**: interfaz común `SynthVoice` (`constructor(sampleRate)`,
   `renderSample(freqs)` → muestra en [-1,1], `noteOn()`). Expone además
   `attackTime`/`releaseTime` (defaults de `constants.js`) para la envolvente
@@ -412,7 +412,7 @@ const SCALES = {
   y soft-clip — NO se duplican por synth.
 - **`polyblep.js`**: `polyBLEP(t, dt)` — corrección band-limited step que se
   RESTA de la onda naive (anti-aliasing de sierra y pulso).
-- Los 6 pads (registry `PAD_CLASSES` en audio-engine.js; **el orden es
+- Los 5 pads (registry `PAD_CLASSES` en audio-engine.js; **el orden es
   sagrado**, ver gotcha sección 10):
   1. **Sine Pad** (`sine-pad.js`) — 3 osciladores seno, el código original
      migrado a la interfaz (comportamiento idéntico).
@@ -421,17 +421,11 @@ const SCALES = {
      `square(t) = saw(t) − saw(t+0.5)`, ambos lados BLEP.
   4. **FM Bell** (`fm-bell-pad.js`) — FM de 2 operadores: portador a la
      frecuencia del acorde, modulador ratio fijo 2.4, índice 3.5. Parciales
-     inarmónicos de campana. ADSR global lo sostiene (solo Pluck es percusivo).
+     inarmónicos de campana. Sostenido por el ADSR global.
   5. **Wavetable** (`wavetable-pad.js`) — tabla de 2048 samples con armónicos
      1..8 (amplitud 1/h, normalizada) pre-calculada EN el constructor; lectura
      con interpolación lineal.
-  6. **Pluck** (`pluck-pad.js`) — Karplus-Strong: 3 delay-lines pre-alocadas
-     (longitud para ~20 Hz, la nota más grave esperada), ruido en `noteOn()`,
-     lectura fraccional (`sampleRate/freq`) para pitch exacto, feedback
-     `0.5·(read + next)·decay` con `decay = 0.9997` (cola ~0.5 s). Ataque
-     propio percusivo: `attackTime = 2 ms` (el ADSR global de 80 ms aplastaría
-     el ataque); el RELEASE global sigue cortando la nota al abrir la mano.
-- **`pad-registry.js`**: registro compartido `PAD_CLASSES` (las 6 clases, sin
+- **`pad-registry.js`**: registro compartido `PAD_CLASSES` (las 5 clases, sin
   APIs de browser) — lo importa audio-engine.js para instanciar las voces y
   main.js para el preview de la intro. Mismo invariante de orden que el
   catálogo (sección 10).
@@ -448,8 +442,8 @@ const SCALES = {
   mouse o hacer click sobre un pad, renderiza ~1 s de la tríada C4 con la
   MISMA clase del registry (`PAD_CLASSES[padIdx]` — sin drift con el worklet)
   en un `AudioBuffer` y lo reproduce con `AudioBufferSourceNode`. Fade-in
-  sigue el ataque propio de la voz (Pluck 4 ms, sostenidos hasta 50 ms) +
-  fade-out 150 ms — sin clicks. El primer click reanuda el AudioContext
+  sigue el ataque propio de la voz (hasta 50 ms) + fade-out 150 ms — sin
+  clicks. El primer click reanuda el AudioContext
   (hover solo suena después de una activación). `stopPreview()` cierra el
   contexto al pulsar Iniciar (el app principal usa su propio AudioContext).
 
@@ -483,9 +477,9 @@ const SCALES = {
     con el attack de la voz nueva, NO el ADSR completo 80/150 ms — cambia de
     timbre sin discontinuidad audible. Sin nota sostenida, el switch es
     directo (silencioso).
-13. **Solo Pluck es percusivo** (attack 2 ms): Sine/Saw/Square/FM/Wavetable
-    usan el ADSR global. No se asume "una talla sirve para todos" — cada voz
-    expone su propia envolvente y el resto usa el default de constants.js.
+13. **Envolvente por voz, no global fija**: cada `SynthVoice` expone su propio
+    `attackTime`/`releaseTime`; los 5 pads actuales usan el default de
+    `constants.js`.
 
 ---
 
@@ -508,9 +502,9 @@ const SCALES = {
   inclinación de la muñeca izquierda (`leftPalmRot/π`). Con la mano en reposo,
   cualquier efecto suena 100% seco sin importar si el algoritmo funciona —
   no confundir con un efecto roto; subir `mix` antes de juzgar al oído.
-- **`id` de `PAD_CATALOG` ↔ posición en `PAD_CLASSES`**: el orden de las 6
+- **`id` de `PAD_CATALOG` ↔ posición en `PAD_CLASSES`**: el orden de las 5
   clases en el registry de audio-engine.js ES el contrato. El `id` de cada
-  entrada del catálogo debe coincidir exactamente (0-5 en orden). Editar un
+  entrada del catálogo debe coincidir exactamente (0-4 en orden). Editar un
   lado sin el otro desincroniza la UI de la intro con el motor de audio —
   mismo tipo de invariante manual que ya causó bugs con los índices del SAB.
 - **`selectedPad` comparte bytes con `float32View[30]`** (vistas int32/float32
@@ -533,26 +527,22 @@ const SCALES = {
   - frac=0.25 → energía 0.75/0.25 entre muestras adyacentes (dirección correcta).
 - DSP de Chorus/Tremolo (acumulador de fase) y Filter (coeficiente one-pole +
   cutoff logarítmico) verificados línea por línea; matemática correcta.
-- **6 pads de synth** verificados con test de render en Node (réplica exacta
+- **5 pads de synth** verificados con test de render en Node (réplica exacta
   del uso real, `tmp/synth-render-test.js`):
-  - Los 6 implementan `SynthVoice` y exponen envolvente > 0.
-  - Salida acotada |x| < 1.2 y con energía (rms > 0.05) en los 6.
-  - **Pitch 440 Hz por autocorrelación**: Sine/Saw/Square/Wavetable/Pluck
+  - Los 5 implementan `SynthVoice` y exponen envolvente > 0.
+  - Salida acotada |x| < 1.2 y con energía (rms > 0.05) en los 5.
+  - **Pitch 440 Hz por autocorrelación**: Sine/Saw/Square/Wavetable
     → ~440.4 Hz; FM Bell → autocorrelación con pico fuerte (parciales
     inarmónicos, no se mide con cruces por cero).
   - **Anti-aliasing**: max diff muestra a muestra < 1.5 en todos (sierra/pulso
     naive saltarían ~2.0; con PolyBLEP la transición se reparte en 2 muestras).
-  - **Pluck**: ataque propio 2 ms; decae solo (rms final < 85% del inicial en
-    1 s — Karplus-Strong decae por PERIODO, ~0.5 s de cola es lo correcto);
-    arranca con energía inmediata.
-  - `node --check` en los 13 archivos JS tocados + imports ES OK en Node +
+  - `node --check` en los archivos JS tocados + imports ES OK en Node +
     servidor sirviendo `/synths/*.js` y `/pad-catalog.js` como
     `application/javascript` (verificado en vivo).
   - **Preview de la intro** verificado con test de buffer en Node
-    (`tmp/preview-test.js`, réplica exacta de `playPadPreview`): los 6 pads
-    → buffer acotado ≤ 0.5, con energía (el Pluck es más bajo en RMS por ser
-    percusivo: pico fuerte + cola), sin clicks al inicio (env=0) ni al final
-    (fade-out).
+    (`tmp/preview-test.js`, réplica exacta de `playPadPreview`): los 5 pads
+    → buffer acotado ≤ 0.5, con energía, sin clicks al inicio (env=0) ni al
+    final (fade-out).
 
 ### Pendiente de prueba manual (requiere cámara)
 
@@ -570,13 +560,12 @@ Checklist final, con todos los fixes de rondas anteriores ya aplicados:
       cambios de parámetro percibidos como continuos.
 - [ ] Las 6 escalas × 12 tónicas — al menos una pasada rápida, sin
       frecuencias erróneas.
-- [ ] Los 6 pads individualmente (Sine, Saw, Square, FM Bell, Wavetable,
-      Pluck) — timbres claramente distintos, sin clicks ni aliasing áspero
+- [ ] Los 5 pads individualmente (Sine, Saw, Square, FM Bell, Wavetable) —
+      timbres claramente distintos, sin clicks ni aliasing áspero
       (especialmente Saw/Square, por BLEP).
 - [ ] Hot-swap de pad con nota sostenida — cambio sin click ni
       discontinuidad audible (re-trigger rápido de 8 ms).
-- [ ] Pluck: ataque percusivo natural y cola que decae sola (~0.5 s), no un
-      pad sostenido; FM Bell suena metálico, no un seno con chorus.
+- [ ] FM Bell suena metálico, no un seno con chorus.
 
 > El historial detallado de bugs por ronda se conserva en `CHANGELOG.md`.
 
