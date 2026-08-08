@@ -19,7 +19,7 @@ The app shows a mirrored camera feed with real-time visualization: oscilloscope,
 ## Run locally
 
 ```bash
-git clone https://github.com/your-username/gesture-synth.git
+git clone https://github.com/ciromendoza/gesture-synth.git
 cd gesture-synth
 npm install
 npm start
